@@ -39,6 +39,8 @@ class MaterialInstance:
         rotation: float = 0.0,
         layer_id: int = 0,
         blend_mode: str = "normal",  # 混合模式: normal, poisson_normal, poisson_mixed
+        color_overlay: Optional[Tuple[int, int, int]] = None,  # RGB颜色叠加
+        overlay_opacity: float = 0.0,  # 叠加透明度 (0.0-1.0)
     ):
         self.material_info = material_info
         self.x = x  # 中心点x坐标
@@ -50,10 +52,21 @@ class MaterialInstance:
         self.visible = True
         self.blend_mode = blend_mode  # 混合模式
 
+        # 色彩叠加属性
+        self.color_overlay = color_overlay  # RGB颜色 (r, g, b)
+        self.overlay_opacity = overlay_opacity  # 叠加透明度
+
         # 缓存变换后的图像和掩码
-        self._transformed_image: Optional[np.ndarray] = None
-        self._transformed_mask: Optional[np.ndarray] = None
+        self._transformed_image_cache: Optional[np.ndarray] = None
+        self._transformed_mask_cache: Optional[np.ndarray] = None
         self._transform_cache_key: Optional[Tuple[float, float]] = None
+
+        # 泊松融合结果缓存
+        self._poisson_cache: Optional[Dict[str, Any]] = None
+        self._poisson_cache_key: Optional[Tuple[int, int, str]] = None
+
+        # 实际显示边界框（用于泊松融合等可能改变显示区域的混合模式）
+        self._actual_display_bbox: Optional[Tuple[int, int, int, int]] = None
 
     @property
     def material_name(self) -> str:
@@ -61,29 +74,69 @@ class MaterialInstance:
         return self.material_info.name
 
     def get_transformed_image(self) -> np.ndarray:
-        """获取变换后的图像"""
-        cache_key = (self.scale, self.rotation)
-        if self._transform_cache_key != cache_key:
+        """获取变换后的图像（包含色彩叠加）"""
+        if self._transformed_image_cache is None:
             self._update_transformed_cache()
-        if self._transformed_image is None:
-            return self.material_info.image.copy()
-        return self._transformed_image
+
+        # 应用色彩叠加
+        if self.color_overlay and self.overlay_opacity > 0.0:
+            return self._apply_color_overlay(self._transformed_image_cache)
+        else:
+            return self._transformed_image_cache.copy()
+
+    def _get_transformed_image_without_color(self) -> np.ndarray:
+        """获取不包含色彩叠加的变换图像（用于泊松融合）"""
+        if self._transformed_image_cache is None:
+            self._update_transformed_cache()
+        return self._transformed_image_cache.copy()
 
     def get_transformed_mask(self) -> Optional[np.ndarray]:
         """获取变换后的掩码"""
-        cache_key = (self.scale, self.rotation)
-        if self._transform_cache_key != cache_key:
+        if self._transformed_mask_cache is None:
             self._update_transformed_cache()
-        return self._transformed_mask
+        return self._transformed_mask_cache
 
     def _update_transformed_cache(self):
         """更新变换缓存"""
-        self._transformed_image = self._transform_image(self.material_info.image)
+        # 检查是否需要更新缓存
+        cache_key = (self.scale, self.rotation)
+        if (
+            self._transform_cache_key == cache_key
+            and self._transformed_image_cache is not None
+        ):
+            return
+
+        # 变换图像（不包含色彩叠加）
+        self._transformed_image_cache = self._transform_image(self.material_info.image)
+
+        # 变换掩码
         if self.material_info.mask is not None:
-            self._transformed_mask = self._transform_image(self.material_info.mask)
+            self._transformed_mask_cache = self._transform_image(
+                self.material_info.mask
+            )
         else:
-            self._transformed_mask = None
-        self._transform_cache_key = (self.scale, self.rotation)
+            self._transformed_mask_cache = None
+
+        # 更新缓存键
+        self._transform_cache_key = cache_key
+
+        # 清除泊松融合缓存（因为变换改变了）
+        self._poisson_cache = None
+        self._poisson_cache_key = None
+
+    def _apply_color_overlay(self, image: np.ndarray) -> np.ndarray:
+        """应用色彩叠加"""
+        if self.color_overlay is None or self.overlay_opacity <= 0.0:
+            return image
+
+        # 创建颜色叠加图层
+        overlay = np.full_like(image, self.color_overlay[::-1])  # BGR格式
+
+        # 应用透明度混合
+        alpha = self.overlay_opacity
+        result = cv2.addWeighted(image, 1 - alpha, overlay, alpha, 0)
+
+        return result
 
     def _transform_image(self, image: np.ndarray) -> np.ndarray:
         """对图像进行变换（缩放和旋转）"""
@@ -288,6 +341,27 @@ class MaterialInstance:
             "blend_mode": self.blend_mode,
         }
 
+    def get_display_bounding_rect(self) -> Tuple[int, int, int, int]:
+        """获取显示边界框 - 根据混合模式返回最合适的边界框"""
+        # 如果有实际显示边界框（通常用于泊松融合），优先使用
+        if self._actual_display_bbox is not None:
+            return self._actual_display_bbox
+
+        # 否则根据混合模式选择合适的边界框
+        if self.blend_mode in ["poisson_normal", "poisson_mixed"]:
+            # 泊松融合可能会稍微扩展边界，使用掩码边界框并稍微扩展
+            x1, y1, x2, y2 = self.get_mask_bounding_rect()
+            expansion = 2  # 像素
+            return (
+                max(0, x1 - expansion),
+                max(0, y1 - expansion),
+                x2 + expansion,
+                y2 + expansion,
+            )
+        else:
+            # 普通模式使用掩码边界框
+            return self.get_mask_bounding_rect()
+
 
 class MaterialManager:
     """素材管理器"""
@@ -357,6 +431,8 @@ class MaterialManager:
         rotation: float = 0.0,
         layer_id: int = 0,
         blend_mode: str = "normal",
+        color_overlay: Optional[Tuple[int, int, int]] = None,
+        overlay_opacity: float = 0.0,
     ) -> Optional[MaterialInstance]:
         """创建素材实例"""
         material_info = self.get_material(material_name)
@@ -364,5 +440,13 @@ class MaterialManager:
             return None
 
         return MaterialInstance(
-            material_info, x, y, scale, rotation, layer_id, blend_mode
+            material_info,
+            x,
+            y,
+            scale,
+            rotation,
+            layer_id,
+            blend_mode,
+            color_overlay,
+            overlay_opacity,
         )

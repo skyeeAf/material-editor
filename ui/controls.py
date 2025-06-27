@@ -7,11 +7,13 @@ from pathlib import Path
 from typing import List, Optional
 
 from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtGui import QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDoubleSpinBox,
+    QFormLayout,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -33,6 +35,7 @@ from PySide6.QtWidgets import (
 
 from core.layer import Layer, LayerManager
 from core.material import MaterialInfo, MaterialInstance, MaterialManager
+from ui.color_picker import BackgroundColorPicker
 
 
 class MaterialListWidget(QWidget):
@@ -287,6 +290,10 @@ class PropertyEditor(QWidget):
         self.property_layout = QVBoxLayout(self.property_container)
         scroll_area.setWidget(self.property_container)
 
+        # 初始化背景取色器
+        self.color_picker = BackgroundColorPicker()
+        self.color_picker.color_picked.connect(self._on_background_color_picked)
+
         # 默认显示无选择状态
         self._show_no_selection()
 
@@ -318,13 +325,15 @@ class PropertyEditor(QWidget):
                 child.widget().deleteLater()
 
     def set_current_instance(self, instance):
-        """设置当前编辑的实例"""
+        """设置当前选中的素材实例"""
         self.current_instance = instance
-        self._update_properties()
-
-        # 确保组件获得焦点以响应键盘事件
         if instance:
-            self.setFocus()
+            self._update_properties()
+            # 确保取色器有背景图像
+            if hasattr(self, "_background_image"):
+                self.color_picker.set_background_image(self._background_image)
+        else:
+            self._show_no_selection()
 
     def _update_properties(self):
         """更新属性显示"""
@@ -428,8 +437,54 @@ class PropertyEditor(QWidget):
 
         self.property_layout.addWidget(transform_group)
 
-        # 添加弹性空间
-        self.property_layout.addStretch()
+        # 色彩叠加控件组
+        color_group = QGroupBox("色彩叠加")
+        color_layout = QFormLayout(color_group)
+
+        # 颜色选择行
+        color_row_layout = QHBoxLayout()
+
+        # 颜色按钮
+        self.color_button = QPushButton("透明")
+        self.color_button.setMinimumSize(50, 30)
+        self.color_button.setStyleSheet(
+            "background-color: transparent; border: 1px solid gray;"
+        )
+        self.color_button.clicked.connect(self._on_color_button_clicked)
+        color_row_layout.addWidget(self.color_button)
+
+        # 清除颜色按钮
+        clear_color_btn = QPushButton("清除")
+        clear_color_btn.setMaximumSize(50, 30)
+        clear_color_btn.clicked.connect(self._on_clear_color_clicked)
+        color_row_layout.addWidget(clear_color_btn)
+
+        color_row_layout.addStretch()
+        color_layout.addRow("颜色:", color_row_layout)
+
+        # 透明度控件
+        opacity_layout = QHBoxLayout()
+        self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.opacity_slider.setRange(0, 100)
+        self.opacity_slider.setValue(0)
+        self.opacity_slider.valueChanged.connect(self._on_opacity_changed)
+        opacity_layout.addWidget(self.opacity_slider)
+
+        self.opacity_spinbox = QSpinBox()
+        self.opacity_spinbox.setRange(0, 100)
+        self.opacity_spinbox.setSuffix("%")
+        self.opacity_spinbox.setValue(0)
+        self.opacity_spinbox.valueChanged.connect(self._on_opacity_changed)
+        opacity_layout.addWidget(self.opacity_spinbox)
+
+        color_layout.addRow("透明度:", opacity_layout)
+
+        self.property_layout.addWidget(color_group)
+
+        # 背景取色器
+        self.color_picker = BackgroundColorPicker()
+        self.color_picker.color_picked.connect(self._on_background_color_picked)
+        self.property_layout.addWidget(self.color_picker)
 
     def _on_blend_mode_changed(self, text: str):
         """混合模式改变事件"""
@@ -493,6 +548,91 @@ class PropertyEditor(QWidget):
             self.blend_combo.setCurrentText(display_mode)
             self.blend_combo.blockSignals(False)
 
+        # 更新色彩叠加控件的值
+        if hasattr(self, "color_button"):
+            current_color = getattr(self.current_instance, "color_overlay", None)
+            if current_color:
+                color = QColor(current_color[0], current_color[1], current_color[2])
+                self.color_button.setStyleSheet(
+                    f"background-color: {color.name()}; border: 1px solid gray;"
+                )
+                self.color_button.setText("")
+            else:
+                self.color_button.setStyleSheet(
+                    "background-color: transparent; border: 1px solid gray;"
+                )
+                self.color_button.setText("透明")
+
+        if hasattr(self, "opacity_slider"):
+            current_opacity = getattr(self.current_instance, "overlay_opacity", 0.0)
+            self.opacity_slider.blockSignals(True)
+            self.opacity_slider.setValue(int(current_opacity * 100))
+            self.opacity_slider.blockSignals(False)
+
+        if hasattr(self, "opacity_spinbox"):
+            current_opacity = getattr(self.current_instance, "overlay_opacity", 0.0)
+            self.opacity_spinbox.blockSignals(True)
+            self.opacity_spinbox.setValue(int(current_opacity * 100))
+            self.opacity_spinbox.blockSignals(False)
+
+    def _on_color_button_clicked(self):
+        """颜色按钮点击事件"""
+        color_dialog = QColorDialog()
+        color = color_dialog.getColor()
+        if color.isValid():
+            self.current_instance.color_overlay = (
+                color.red(),
+                color.green(),
+                color.blue(),
+            )
+            self.property_changed.emit(
+                "color_overlay", "color", self.current_instance.color_overlay
+            )
+            self._update_values_only()
+
+    def _on_clear_color_clicked(self):
+        """清除颜色按钮点击事件"""
+        self.current_instance.color_overlay = None
+        self.property_changed.emit(
+            "color_overlay", "color", self.current_instance.color_overlay
+        )
+        self._update_values_only()
+
+    def _on_opacity_changed(self, value: int):
+        """透明度改变事件"""
+        if not hasattr(self, "current_instance") or not self.current_instance:
+            return
+
+        opacity = value / 100.0
+        self.current_instance.overlay_opacity = opacity
+        self.property_changed.emit("overlay_opacity", "opacity", opacity)
+        self._update_values_only()
+
+    def _on_background_color_picked(self, color: tuple):
+        """背景颜色被选中事件"""
+        if not hasattr(self, "current_instance") or not self.current_instance:
+            return
+
+        self.current_instance.color_overlay = color
+        self.property_changed.emit(
+            "color_overlay", "color", self.current_instance.color_overlay
+        )
+        self._update_values_only()
+
+    def _set_background_image_cache(self, image):
+        """缓存背景图像"""
+        self._background_image = image
+        self.set_background_image(image)
+
+    def set_background_image(self, image):
+        """设置背景图像"""
+        self._background_image = image
+        if hasattr(self, "color_picker") and self.color_picker:
+            print(f"设置取色器背景图像: {image is not None}")
+            self.color_picker.set_background_image(image)
+        else:
+            print("取色器未初始化")
+
 
 class ControlPanel(QWidget):
     """控制面板主组件"""
@@ -548,7 +688,7 @@ class ControlPanel(QWidget):
         self.layer_widget.refresh_layers()
 
     def set_current_instance(self, instance):
-        """设置当前编辑的实例"""
+        """设置当前选中的素材实例"""
         self.property_widget.set_current_instance(instance)
 
     def set_active_tab(self, tab_name: str):
@@ -563,3 +703,11 @@ class ControlPanel(QWidget):
     def select_layer(self, layer_id: int):
         """选中指定图层"""
         self.layer_widget.select_layer(layer_id)
+
+    def set_background_image(self, image):
+        """设置背景图像"""
+        if hasattr(self, "color_picker") and self.color_picker:
+            print(f"设置取色器背景图像: {image is not None}")
+            self.color_picker.set_background_image(image)
+        else:
+            print("取色器未初始化")

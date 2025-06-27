@@ -4,7 +4,9 @@
 基于PyQt6和OpenCV的图像合成工具
 """
 
+import math
 import os
+import random
 import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -13,6 +15,7 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -31,6 +34,7 @@ from core.layer import LayerManager
 from core.material import MaterialManager
 from ui.canvas import CanvasScrollArea
 from ui.controls import ControlPanel
+from ui.dialogs import RandomGenerateDialog
 from utils.file_utils import FileManager
 
 
@@ -149,6 +153,14 @@ class MaterialEditor(QMainWindow):
 
         edit_menu.addSeparator()
 
+        # 随机生成物体
+        random_generate_action = QAction("随机生成物体(&R)", self)
+        random_generate_action.setShortcut(QKeySequence("Ctrl+R"))
+        random_generate_action.triggered.connect(self.show_random_generate_dialog)
+        edit_menu.addAction(random_generate_action)
+
+        edit_menu.addSeparator()
+
         # 添加模式子菜单
         add_mode_menu = edit_menu.addMenu("添加模式(&A)")
 
@@ -186,6 +198,23 @@ class MaterialEditor(QMainWindow):
             self.canvas_area.canvas.zoom_to_actual_size
         )
         view_menu.addAction(actual_size_action)
+
+        view_menu.addSeparator()
+
+        # 性能设置子菜单
+        performance_menu = view_menu.addMenu("性能设置(&P)")
+
+        # 增量更新选项
+        self.incremental_update_action = QAction("启用增量更新", self)
+        self.incremental_update_action.setCheckable(True)
+        self.incremental_update_action.setChecked(True)
+        self.incremental_update_action.setToolTip(
+            "拖动时只重新计算当前素材，提高多素材时的性能"
+        )
+        self.incremental_update_action.triggered.connect(
+            self._toggle_incremental_update
+        )
+        performance_menu.addAction(self.incremental_update_action)
 
         # 帮助菜单
         help_menu = menubar.addMenu("帮助(&H)")
@@ -227,6 +256,11 @@ class MaterialEditor(QMainWindow):
         clear_materials_action = QAction("清空素材", self)
         clear_materials_action.triggered.connect(self.clear_all_materials)
         toolbar.addAction(clear_materials_action)
+
+        # 随机生成
+        random_generate_action = QAction("随机生成", self)
+        random_generate_action.triggered.connect(self.show_random_generate_dialog)
+        toolbar.addAction(random_generate_action)
 
         toolbar.addSeparator()
 
@@ -302,11 +336,16 @@ class MaterialEditor(QMainWindow):
 
     def _on_canvas_clicked(self, x: int, y: int):
         """画布单击事件"""
-        if self.add_mode == "click":
+        # 检查是否正在使用取色器
+        if hasattr(self.control_panel.property_widget, "color_picker"):
+            color_picker = self.control_panel.property_widget.color_picker
+            if color_picker.is_sampling_enabled():
+                # 进行取色操作
+                color_picker.sample_color_at_position(x, y)
+                return
+
+        if self.add_mode == "single_click":
             self._add_material_at_position(x, y)
-        else:
-            # 双击模式下，单击只显示坐标
-            self.status_label.setText(f"点击位置: ({x}, {y}) - 双击此位置可添加素材")
 
     def _on_canvas_double_clicked(self, x: int, y: int):
         """画布双击事件"""
@@ -441,17 +480,27 @@ class MaterialEditor(QMainWindow):
                     if property_name == "scale":
                         selected_instance.scale = value
                         # 清除变换缓存以重新计算
+                        selected_instance._transformed_image_cache = None
+                        selected_instance._transformed_mask_cache = None
                         selected_instance._transform_cache_key = None
                     elif property_name == "rotation":
                         selected_instance.rotation = value
                         # 清除变换缓存以重新计算
+                        selected_instance._transformed_image_cache = None
+                        selected_instance._transformed_mask_cache = None
                         selected_instance._transform_cache_key = None
                 elif group == "blend":
                     if property_name == "mode":
                         selected_instance.blend_mode = value
+                elif group == "color_overlay":
+                    if property_name == "color":
+                        selected_instance.color_overlay = value
+                elif group == "overlay_opacity":
+                    if property_name == "opacity":
+                        selected_instance.overlay_opacity = value
 
                 # 更新画布显示
-                self.canvas_area.canvas.update_canvas()
+                self.canvas_area.canvas.update_canvas(force_full_update=True)
 
                 # 标记项目已修改
                 self.is_modified = True
@@ -498,40 +547,28 @@ class MaterialEditor(QMainWindow):
                 import cv2
                 import numpy as np
 
+                # 加载图像
                 image = cv2.imdecode(
                     np.fromfile(file_path, dtype=np.uint8), cv2.IMREAD_COLOR
                 )
+
                 if image is not None:
-                    # 将单张图像作为背景图像列表
-                    self.background_images = [file_path]
-                    self.current_background_index = 0
-
-                    # 自动清空所有素材
-                    self.layer_manager.clear_all_layers()
-
-                    # 清除画布选择
-                    self.canvas_area.canvas.selected_instance = None
-
-                    # 设置背景图像
                     self.canvas_area.canvas.set_background_image(image)
-                    self.current_background_path = file_path
-                    self.is_modified = True
-                    self.current_selected_material = None
 
-                    # 适应窗口大小
-                    self.canvas_area.canvas.zoom_to_fit()
+                    # 设置取色器的背景图像
+                    self.control_panel.property_widget.set_background_image(image)
 
-                    # 更新界面
-                    self._update_window_title()
-                    self._update_background_navigation_buttons()
-                    self.control_panel.refresh_layers()
-                    self.control_panel.set_current_instance(None)
-
-                    self.status_label.setText("背景图像加载成功，已清空素材并适应窗口")
+                    # 更新画布显示
+                    self.canvas_area.canvas.update_canvas()
+                    print(f"背景图像加载成功: {file_path}")
                 else:
-                    QMessageBox.warning(self, "警告", "无法加载图像文件")
+                    QMessageBox.warning(self, "错误", "无法加载图像文件")
             except Exception as e:
-                QMessageBox.critical(self, "错误", f"加载背景图像失败: {str(e)}")
+                QMessageBox.critical(self, "错误", f"加载背景图像失败：{str(e)}")
+                print(f"加载背景图像失败: {e}")
+                import traceback
+
+                traceback.print_exc()
 
     def load_materials(self):
         """加载素材目录"""
@@ -849,7 +886,17 @@ class MaterialEditor(QMainWindow):
         if group == "transform":
             selected_instance = self.canvas_area.canvas.selected_instance
             if selected_instance:
+                selected_instance._transformed_image_cache = None
+                selected_instance._transformed_mask_cache = None
                 selected_instance._transform_cache_key = None
+
+        # 更新画布显示
+        self.canvas_area.canvas.update_canvas(force_full_update=True)
+
+        # 更新属性编辑器显示
+        self.control_panel.set_current_instance(
+            self.canvas_area.canvas.selected_instance
+        )
 
     def export_image(self):
         """导出图像（兼容性方法）"""
@@ -963,43 +1010,41 @@ class MaterialEditor(QMainWindow):
 
     def load_background_directory(self):
         """加载背景图像目录"""
-        dir_path = QFileDialog.getExistingDirectory(self, "选择背景图像目录")
+        directory = QFileDialog.getExistingDirectory(self, "选择背景图像目录")
 
-        if dir_path:
+        if directory:
             try:
-                import os
-
                 # 支持的图像格式
-                image_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
+                image_extensions = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif"}
 
                 # 获取目录中的所有图像文件
                 image_files = []
-                for file in os.listdir(dir_path):
-                    if any(file.lower().endswith(ext) for ext in image_extensions):
-                        image_files.append(os.path.join(dir_path, file))
+                for file_path in Path(directory).iterdir():
+                    if (
+                        file_path.is_file()
+                        and file_path.suffix.lower() in image_extensions
+                    ):
+                        image_files.append(str(file_path))
 
                 if not image_files:
-                    QMessageBox.warning(self, "警告", "目录中没有找到图像文件")
+                    QMessageBox.information(self, "提示", "所选目录中没有找到图像文件")
                     return
 
                 # 按文件名排序
                 image_files.sort()
-
                 self.background_images = image_files
                 self.current_background_index = 0
 
-                # 加载第一张图像（会自动清空素材并适应窗口）
+                # 加载第一张图像
                 self._load_background_by_index(0)
-
-                # 更新按钮状态
                 self._update_background_navigation_buttons()
 
                 self.status_label.setText(
-                    f"加载了 {len(image_files)} 张背景图像，已清空素材"
+                    f"加载背景目录成功，共 {len(image_files)} 张图像"
                 )
 
             except Exception as e:
-                QMessageBox.critical(self, "错误", f"加载背景图像目录失败: {str(e)}")
+                QMessageBox.critical(self, "错误", f"加载背景目录失败: {str(e)}")
 
     def prev_background(self):
         """切换到上一张背景图像"""
@@ -1041,6 +1086,9 @@ class MaterialEditor(QMainWindow):
                     self.current_background_path = file_path
                     self.is_modified = True
                     self.current_selected_material = None
+
+                    # 更新取色器的背景图像
+                    self.control_panel.property_widget.set_background_image(image)
 
                     # 适应窗口大小
                     self.canvas_area.canvas.zoom_to_fit()
@@ -1101,6 +1149,372 @@ class MaterialEditor(QMainWindow):
             self._update_window_title()
 
             self.status_label.setText("已清空所有素材")
+
+    def show_random_generate_dialog(self):
+        """显示随机生成物体对话框"""
+        # 检查是否有背景图像
+        if self.canvas_area.canvas.background_image is None:
+            QMessageBox.warning(self, "警告", "请先加载背景图像")
+            return
+
+        # 检查是否有素材
+        material_names = self.material_manager.get_material_names()
+        if not material_names:
+            QMessageBox.warning(self, "警告", "请先加载素材")
+            return
+
+        # 获取画布尺寸
+        canvas_height, canvas_width = self.canvas_area.canvas.background_image.shape[:2]
+        canvas_size = (canvas_width, canvas_height)
+
+        # 显示对话框
+        dialog = RandomGenerateDialog(
+            material_names, canvas_size, self.canvas_area.canvas.background_image, self
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            params = dialog.get_generation_params()
+            self.generate_random_objects(params)
+
+    def generate_random_objects(self, params: dict):
+        """根据参数随机生成物体"""
+        try:
+            count = params["count"]
+            mode = params["mode"]
+            position_params = params["position"]
+            rotation_params = params["rotation"]
+            scale_params = params["scale"]
+            blend_params = params["blend"]
+            color_params = params["color_overlay"]
+
+            # 获取素材列表
+            available_materials = list(self.material_manager.materials.keys())
+            if not available_materials:
+                self.status_label.setText("没有可用的素材")
+                return
+
+            # 根据模式选择要使用的素材
+            if mode == 0:  # 随机选择素材
+                materials_to_use = [
+                    random.choice(available_materials) for _ in range(count)
+                ]
+            elif mode == 1:  # 使用所有素材
+                materials_to_use = (
+                    available_materials * ((count // len(available_materials)) + 1)
+                )[:count]
+            elif mode == 2:  # 仅使用第一个素材
+                materials_to_use = [available_materials[0]] * count
+            elif mode == 3:  # 均匀分布所有素材
+                materials_to_use = []
+                per_material = count // len(available_materials)
+                remainder = count % len(available_materials)
+                for i, material in enumerate(available_materials):
+                    material_count = per_material + (1 if i < remainder else 0)
+                    materials_to_use.extend([material] * material_count)
+                random.shuffle(materials_to_use)
+            else:
+                materials_to_use = [
+                    random.choice(available_materials) for _ in range(count)
+                ]
+
+            # 生成位置
+            positions = self._generate_positions(count, position_params)
+            if not positions:
+                self.status_label.setText("无法生成有效位置")
+                return
+
+            print(f"开始生成 {count} 个随机物体...")
+            print(f"位置参数: {position_params}")
+            print(f"混合模式参数: {blend_params}")
+            print(f"色彩叠加参数: {color_params}")
+
+            generated_count = 0
+            failed_count = 0
+
+            for i in range(min(count, len(positions), len(materials_to_use))):
+                try:
+                    material_name = materials_to_use[i]
+                    x, y = positions[i]
+
+                    # 生成旋转角度
+                    if rotation_params["enabled"]:
+                        rotation_min, rotation_max = rotation_params["range"]
+                        rotation = random.uniform(rotation_min, rotation_max)
+                    else:
+                        rotation = 0.0
+
+                    # 生成缩放比例
+                    if scale_params["enabled"]:
+                        scale_min, scale_max = scale_params["range"]
+                        scale = random.uniform(scale_min, scale_max)
+                    else:
+                        scale = 1.0
+
+                    # 选择混合模式
+                    if blend_params["enabled"] and blend_params["modes"]:
+                        blend_mode = random.choice(blend_params["modes"])
+                    else:
+                        blend_mode = "normal"
+
+                    # 生成色彩叠加
+                    color_overlay = None
+                    overlay_opacity = 0.0
+
+                    if color_params.get("enabled", False):
+                        if color_params.get("use_background_colors", False):
+                            # 使用背景色
+                            color_overlay = self._generate_background_color_at_position(
+                                x, y
+                            )
+                        elif color_params.get("use_preset", False):
+                            # 使用预设颜色组
+                            preset_group = color_params.get("preset_group", "暖色调")
+                            color_overlay = self._generate_preset_color(preset_group)
+                        else:
+                            # 完全随机颜色
+                            color_overlay = self._generate_random_color()
+
+                        # 生成透明度
+                        min_opacity, max_opacity = color_params.get(
+                            "opacity_range", (0.2, 0.6)
+                        )
+                        overlay_opacity = random.uniform(min_opacity, max_opacity)
+
+                    # 创建素材实例
+                    instance = self.material_manager.create_instance(
+                        material_name,
+                        x,
+                        y,
+                        scale=scale,
+                        rotation=rotation,
+                        layer_id=self.layer_manager.current_layer_id,
+                        blend_mode=blend_mode,
+                        color_overlay=color_overlay,
+                        overlay_opacity=overlay_opacity,
+                    )
+
+                    if instance:
+                        self.layer_manager.add_instance_to_current_layer(instance)
+                        generated_count += 1
+
+                        # 输出详细信息（仅前5个）
+                        if i < 5:
+                            color_info = (
+                                f", 颜色叠加: {color_overlay}, 透明度: {overlay_opacity:.2f}"
+                                if color_overlay
+                                else ""
+                            )
+                            print(
+                                f"生成第 {i + 1} 个: {material_name}, 位置({x},{y}), 缩放{scale:.2f}, 旋转{rotation:.1f}°, 混合模式: {blend_mode}{color_info}"
+                            )
+                    else:
+                        failed_count += 1
+                        print(f"创建素材实例失败: {material_name}")
+
+                except Exception as e:
+                    failed_count += 1
+                    print(f"生成第 {i + 1} 个物体时出错: {e}")
+
+                # 更新进度（每10个更新一次界面）
+                if (i + 1) % 10 == 0 or i == count - 1:
+                    progress = min(100, int((i + 1) / count * 100))
+                    self.status_label.setText(
+                        f"生成进度: {progress}% ({i + 1}/{count})"
+                    )
+                    QApplication.processEvents()
+
+            # 更新界面
+            self.canvas_area.canvas.update_canvas()
+            self.control_panel.refresh_layers()
+
+            # 标记项目已修改
+            self.is_modified = True
+            self._update_window_title()
+
+            # 显示结果
+            result_msg = f"随机生成完成: 成功 {generated_count} 个"
+            if failed_count > 0:
+                result_msg += f", 失败 {failed_count} 个"
+
+            if blend_params["enabled"]:
+                result_msg += f", 使用混合模式: {', '.join(blend_params['modes'])}"
+
+            if color_params["enabled"]:
+                result_msg += f", 启用色彩叠加"
+
+            self.status_label.setText(result_msg)
+            print(result_msg)
+
+        except Exception as e:
+            error_msg = f"随机生成失败: {str(e)}"
+            self.status_label.setText(error_msg)
+            print(error_msg)
+            import traceback
+
+            traceback.print_exc()
+
+    def _generate_positions(
+        self,
+        count: int,
+        position_params: dict,
+    ) -> List[Tuple[int, int]]:
+        """生成随机位置列表"""
+        positions = []
+        x_min, x_max = position_params["x_range"]
+        y_min, y_max = position_params["y_range"]
+        avoid_overlap = position_params["avoid_overlap"]
+
+        # 确保范围有效
+        if x_min >= x_max or y_min >= y_max:
+            print(f"无效的位置范围: x({x_min}-{x_max}), y({y_min}-{y_max})")
+            return []
+
+        print(
+            f"生成位置范围: x({x_min}-{x_max}), y({y_min}-{y_max}), 避免重叠: {avoid_overlap}"
+        )
+
+        if avoid_overlap:
+            # 尝试避免重叠的位置生成
+            min_distance = 50  # 最小距离
+            max_attempts = count * 20  # 最大尝试次数
+            attempts = 0
+
+            while len(positions) < count and attempts < max_attempts:
+                x = random.randint(x_min, x_max)
+                y = random.randint(y_min, y_max)
+
+                # 检查是否与其他位置重叠
+                if any(
+                    (x - px) ** 2 + (y - py) ** 2 < min_distance**2
+                    for px, py in positions
+                ):
+                    continue
+
+                positions.append((x, y))
+                attempts += 1
+
+        print(f"实际生成位置数量: {len(positions)}")
+        return positions
+
+    def _generate_background_color_at_position(
+        self, x: int, y: int
+    ) -> Tuple[int, int, int]:
+        """在指定位置提取背景颜色"""
+        if self.canvas_area.canvas.background_image is None:
+            return self._generate_random_color()
+
+        try:
+            # 获取背景图像
+            bg_image = self.canvas_area.canvas.background_image
+            h, w = bg_image.shape[:2]
+
+            # 确保坐标在图像范围内
+            x = max(0, min(x, w - 1))
+            y = max(0, min(y, h - 1))
+
+            # 在位置周围取样（3x3区域）
+            sample_size = 3
+            colors = []
+
+            for dy in range(-sample_size // 2, sample_size // 2 + 1):
+                for dx in range(-sample_size // 2, sample_size // 2 + 1):
+                    sample_x = max(0, min(x + dx, w - 1))
+                    sample_y = max(0, min(y + dy, h - 1))
+
+                    # 获取BGR颜色并转换为RGB
+                    bgr_color = bg_image[sample_y, sample_x]
+                    rgb_color = (
+                        int(bgr_color[2]),
+                        int(bgr_color[1]),
+                        int(bgr_color[0]),
+                    )
+                    colors.append(rgb_color)
+
+            # 随机选择一个采样颜色
+            import random
+
+            return random.choice(colors)
+
+        except Exception as e:
+            print(f"提取背景色失败: {e}")
+            return self._generate_random_color()
+
+    def _generate_random_color(self) -> Tuple[int, int, int]:
+        """生成完全随机的颜色"""
+        return (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+
+    def _generate_preset_color(self, preset_name: str) -> Tuple[int, int, int]:
+        """根据预设名称生成颜色"""
+        presets = {
+            "暖色调": [
+                (255, 69, 0),  # 橙红
+                (255, 140, 0),  # 深橙
+                (255, 165, 0),  # 橙色
+                (255, 215, 0),  # 金色
+                (255, 20, 147),  # 深粉红
+                (220, 20, 60),  # 深红
+            ],
+            "冷色调": [
+                (0, 191, 255),  # 深天蓝
+                (30, 144, 255),  # 道奇蓝
+                (0, 206, 209),  # 深绿松石
+                (64, 224, 208),  # 绿松石
+                (72, 61, 139),  # 深石板蓝
+                (123, 104, 238),  # 中石板蓝
+            ],
+            "大地色": [
+                (139, 69, 19),  # 马鞍棕
+                (160, 82, 45),  # 马鞍棕
+                (210, 180, 140),  # 棕褐
+                (222, 184, 135),  # 浅黄褐
+                (205, 133, 63),  # 秘鲁
+                (244, 164, 96),  # 沙棕
+            ],
+            "彩虹色": [
+                (255, 0, 0),  # 红
+                (255, 165, 0),  # 橙
+                (255, 255, 0),  # 黄
+                (0, 255, 0),  # 绿
+                (0, 0, 255),  # 蓝
+                (75, 0, 130),  # 靛
+                (238, 130, 238),  # 紫
+            ],
+            "单色调-红": [
+                (255, 182, 193),  # 浅粉红
+                (255, 105, 180),  # 热粉红
+                (255, 20, 147),  # 深粉红
+                (220, 20, 60),  # 深红
+                (178, 34, 34),  # 火砖红
+                (139, 0, 0),  # 深红
+            ],
+            "单色调-蓝": [
+                (173, 216, 230),  # 浅蓝
+                (135, 206, 235),  # 天蓝
+                (0, 191, 255),  # 深天蓝
+                (30, 144, 255),  # 道奇蓝
+                (0, 0, 255),  # 蓝
+                (0, 0, 139),  # 深蓝
+            ],
+            "单色调-绿": [
+                (144, 238, 144),  # 浅绿
+                (152, 251, 152),  # 苍绿
+                (0, 255, 127),  # 春绿
+                (0, 250, 154),  # 中春绿
+                (0, 255, 0),  # 绿
+                (0, 128, 0),  # 绿
+            ],
+        }
+
+        if preset_name in presets:
+            return random.choice(presets[preset_name])
+        else:
+            return self._generate_random_color()
+
+    def _toggle_incremental_update(self, checked: bool):
+        """切换增量更新"""
+        self.canvas_area.canvas.incremental_update_enabled = checked
+        status_text = "增量更新已启用" if checked else "增量更新已禁用"
+        self.status_label.setText(status_text)
+        print(f"性能设置: {status_text}")
 
 
 def main():

@@ -53,6 +53,13 @@ class CanvasWidget(QLabel):
         self.composite_image: Optional[np.ndarray] = None
         self.composite_pixmap: Optional[QPixmap] = None
 
+        # 增量更新优化 - 新增
+        self.base_composite_image: Optional[np.ndarray] = (
+            None  # 基础合成图像（不包含当前拖动的实例）
+        )
+        self.incremental_update_enabled = True  # 是否启用增量更新
+        self.dragging_instance: Optional[MaterialInstance] = None  # 当前拖动的实例
+
         # 交互状态
         self.selected_instance: Optional[MaterialInstance] = None
         self.dragging = False
@@ -60,6 +67,12 @@ class CanvasWidget(QLabel):
         self.drag_start_pos = QPoint()
         self.drag_offset = QPoint()
         self.canvas_drag_start_offset = QPoint()  # 画布拖动开始时的偏移
+
+        # 拖动优化
+        self.drag_update_timer = QTimer()
+        self.drag_update_timer.setSingleShot(True)
+        self.drag_update_timer.timeout.connect(self._delayed_canvas_update)
+        self.pending_update = False
 
         # 双击检测
         self.click_timer = QTimer()
@@ -90,14 +103,40 @@ class CanvasWidget(QLabel):
         self.layer_manager = layer_manager
         self.update_canvas()
 
-    def update_canvas(self):
+    def update_canvas(self, force_full_update: bool = False):
         """更新画布显示"""
         if self.background_image is None:
             self.composite_image = None
             self.composite_pixmap = None
+            self.base_composite_image = None
             self.update()
             return
 
+        # 如果启用增量更新且正在拖动，使用增量更新
+        if (
+            self.incremental_update_enabled
+            and self.dragging
+            and self.dragging_instance
+            and not force_full_update
+            and self.base_composite_image is not None
+        ):
+            self._incremental_update()
+        else:
+            self._full_update()
+
+        # 转换为QPixmap
+        qimage = numpy_to_qimage(self.composite_image)
+        if qimage:
+            self.composite_pixmap = QPixmap.fromImage(qimage)
+        else:
+            print("QImage转换失败")
+            self.composite_pixmap = None
+
+        # 触发重绘
+        self.update()
+
+    def _full_update(self):
+        """完整更新画布"""
         # 创建合成图像
         canvas_image = self.background_image.copy()
 
@@ -110,104 +149,253 @@ class CanvasWidget(QLabel):
         # 保存合成图像
         self.composite_image = canvas_image
 
-        # 转换为QPixmap
-        qimage = numpy_to_qimage(canvas_image)
-        if qimage:
-            self.composite_pixmap = QPixmap.fromImage(qimage)
-        else:
-            print("QImage转换失败")
-            self.composite_pixmap = None
+        # 如果当前没有拖动，更新基础合成图像
+        if not self.dragging:
+            self.base_composite_image = canvas_image.copy()
 
-        # 触发重绘
-        self.update()
+    def _incremental_update(self):
+        """增量更新画布（仅重绘拖动的实例）"""
+        if self.base_composite_image is None or self.dragging_instance is None:
+            self._full_update()
+            return
+
+        # 从基础图像开始
+        canvas_image = self.base_composite_image.copy()
+
+        # 只绘制当前拖动的实例
+        canvas_image = self._draw_instance_on_canvas(
+            canvas_image, self.dragging_instance
+        )
+
+        # 保存合成图像
+        self.composite_image = canvas_image
+
+    def _prepare_base_composite_for_dragging(self, dragging_instance: MaterialInstance):
+        """为拖动准备基础合成图像（不包含拖动的实例）"""
+        if self.background_image is None:
+            return
+
+        # 创建不包含拖动实例的合成图像
+        canvas_image = self.background_image.copy()
+
+        if self.layer_manager:
+            instances = self.layer_manager.get_all_instances()
+            for instance in instances:
+                if instance.visible and instance != dragging_instance:
+                    canvas_image = self._draw_instance_on_canvas(canvas_image, instance)
+
+        self.base_composite_image = canvas_image
 
     def _draw_instance_on_canvas(
         self, canvas: np.ndarray, instance: MaterialInstance
     ) -> np.ndarray:
         """在画布上绘制素材实例"""
         try:
+            # 获取变换后的图像和掩码
             transformed_image = instance.get_transformed_image()
             transformed_mask = instance.get_transformed_mask()
 
-            x1, y1, x2, y2 = instance.get_bounding_rect()
-
-            # 确保边界在画布范围内
-            canvas_h, canvas_w = canvas.shape[:2]
-
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(canvas_w, x2)
-            y2 = min(canvas_h, y2)
-
-            if x1 >= x2 or y1 >= y2:
+            if transformed_image is None or transformed_mask is None:
                 return canvas
 
-            # 计算在变换图像中的对应区域
-            orig_x1, orig_y1, _, _ = instance.get_bounding_rect()
-            mat_x1 = max(0, -orig_x1) if orig_x1 < 0 else 0
-            mat_y1 = max(0, -orig_y1) if orig_y1 < 0 else 0
-            mat_x2 = mat_x1 + (x2 - x1)
-            mat_y2 = mat_y1 + (y2 - y1)
+            # 计算在画布上的位置
+            x = int(instance.x)
+            y = int(instance.y)
 
-            # 裁剪素材区域
-            material_roi = transformed_image[mat_y1:mat_y2, mat_x1:mat_x2]
+            # 获取图像尺寸
+            h, w = transformed_image.shape[:2]
+            canvas_h, canvas_w = canvas.shape[:2]
 
-            if transformed_mask is not None:
-                mask_roi = transformed_mask[mat_y1:mat_y2, mat_x1:mat_x2]
+            # 计算实际的绘制区域
+            src_x1 = max(0, -x)
+            src_y1 = max(0, -y)
+            src_x2 = min(w, canvas_w - x)
+            src_y2 = min(h, canvas_h - y)
 
-                # 改进掩码处理逻辑
-                if len(mask_roi.shape) == 3:
-                    # 如果掩码是彩色的，转换为灰度
-                    gray_mask = cv2.cvtColor(mask_roi, cv2.COLOR_BGR2GRAY)
-                else:
-                    gray_mask = mask_roi.copy()
+            dst_x1 = max(0, x)
+            dst_y1 = max(0, y)
+            dst_x2 = min(canvas_w, x + w)
+            dst_y2 = min(canvas_h, y + h)
 
-                # 创建二值掩码，使用更合适的阈值
-                _, binary_mask = cv2.threshold(gray_mask, 10, 255, cv2.THRESH_BINARY)
+            # 检查是否有有效的绘制区域
+            if (
+                src_x2 <= src_x1
+                or src_y2 <= src_y1
+                or dst_x2 <= dst_x1
+                or dst_y2 <= dst_y1
+            ):
+                return canvas
 
-                canvas_roi = canvas[y1:y2, x1:x2]
+            # 提取有效区域
+            src_image = transformed_image[src_y1:src_y2, src_x1:src_x2]
+            src_mask = transformed_mask[src_y1:src_y2, src_x1:src_x2]
 
-                # 检查尺寸匹配
-                if (
-                    material_roi.shape[:2] == canvas_roi.shape[:2]
-                    and binary_mask.shape == material_roi.shape[:2]
-                ):
-                    # 根据混合模式选择合成方法
-                    blend_mode = getattr(instance, "blend_mode", "normal")
+            # 根据混合模式处理
+            if instance.blend_mode in ["poisson_normal", "poisson_mixed"]:
+                # 泊松融合模式
+                clone_type = (
+                    cv2.NORMAL_CLONE
+                    if instance.blend_mode == "poisson_normal"
+                    else cv2.MIXED_CLONE
+                )
 
-                    if blend_mode == "poisson_normal":
-                        # 泊松融合(正常模式)
-                        canvas = self._poisson_blend(
-                            canvas,
-                            material_roi,
-                            (x1, y1),
-                            binary_mask,
-                            cv2.NORMAL_CLONE,
-                        )
-                    elif blend_mode == "poisson_mixed":
-                        # 泊松融合(混合模式)
-                        canvas = self._poisson_blend(
-                            canvas, material_roi, (x1, y1), binary_mask, cv2.MIXED_CLONE
-                        )
-                    else:
-                        # 普通模式：简单的二值掩码混合
-                        mask_3d = np.stack([binary_mask] * 3, axis=2) > 0
-                        canvas_roi[mask_3d] = material_roi[mask_3d]
-                else:
-                    print(
-                        f"尺寸不匹配: material_roi={material_roi.shape}, canvas_roi={canvas_roi.shape}, mask={binary_mask.shape}"
+                # 执行泊松融合
+                canvas = self._poisson_blend(
+                    canvas, src_image, (dst_x1, dst_y1), src_mask, clone_type
+                )
+
+                # 泊松融合后应用颜色叠加
+                if instance.color_overlay and instance.overlay_opacity > 0:
+                    canvas = self._apply_color_overlay_after_poisson(
+                        canvas, instance, (dst_x1, dst_y1, dst_x2, dst_y2), src_mask
                     )
             else:
-                # 直接覆盖（没有掩码的情况）
-                canvas[y1:y2, x1:x2] = material_roi
+                # 普通混合模式
+                # 先应用颜色叠加到素材
+                if instance.color_overlay and instance.overlay_opacity > 0:
+                    src_image = self._apply_color_overlay_to_image(
+                        src_image,
+                        src_mask,
+                        instance.color_overlay,
+                        instance.overlay_opacity,
+                    )
+
+                # 然后混合到画布
+                canvas = self._normal_blend(
+                    canvas, src_image, src_mask, (dst_x1, dst_y1, dst_x2, dst_y2)
+                )
+
+            return canvas
 
         except Exception as e:
             print(f"绘制素材实例失败: {e}")
             import traceback
 
             traceback.print_exc()
+            return canvas
 
-        return canvas
+    def _apply_color_overlay_to_image(
+        self,
+        image: np.ndarray,
+        mask: np.ndarray,
+        color: Tuple[int, int, int],
+        opacity: float,
+    ) -> np.ndarray:
+        """在图像上应用颜色叠加（普通模式）"""
+        try:
+            # 创建颜色层 (BGR格式)
+            overlay_color = (color[2], color[1], color[0])  # RGB转BGR
+            color_layer = np.full_like(image, overlay_color, dtype=np.uint8)
+
+            # 使用掩码和透明度创建混合权重
+            blend_mask = (mask.astype(np.float32) / 255.0) * opacity
+
+            # 扩展掩码到3通道
+            if len(blend_mask.shape) == 2:
+                blend_mask = np.stack([blend_mask] * 3, axis=2)
+
+            # 混合颜色
+            result = (
+                image.astype(np.float32) * (1 - blend_mask)
+                + color_layer.astype(np.float32) * blend_mask
+            )
+
+            return result.astype(np.uint8)
+
+        except Exception as e:
+            print(f"应用颜色叠加失败: {e}")
+            return image
+
+    def _apply_color_overlay_after_poisson(
+        self,
+        canvas: np.ndarray,
+        instance: MaterialInstance,
+        bbox: Tuple[int, int, int, int],
+        original_mask: np.ndarray,
+    ) -> np.ndarray:
+        """泊松融合后应用颜色叠加"""
+        try:
+            x1, y1, x2, y2 = bbox
+
+            # 获取画布ROI
+            canvas_roi = canvas[y1:y2, x1:x2]
+
+            # 创建颜色层 (BGR格式)
+            overlay_color = (
+                instance.color_overlay[2],
+                instance.color_overlay[1],
+                instance.color_overlay[0],
+            )  # RGB转BGR
+            color_layer = np.full_like(canvas_roi, overlay_color, dtype=np.uint8)
+
+            # 使用原始掩码创建颜色掩码
+            # 白色区域为有效区域（素材），黑色区域为背景
+            color_mask = (
+                original_mask.astype(np.float32) / 255.0 * instance.overlay_opacity
+            )
+
+            # 扩展掩码到3通道
+            if len(color_mask.shape) == 2:
+                color_mask = np.stack([color_mask] * 3, axis=2)
+
+            # 确保掩码尺寸匹配
+            if color_mask.shape[:2] != canvas_roi.shape[:2]:
+                color_mask = cv2.resize(
+                    color_mask, (canvas_roi.shape[1], canvas_roi.shape[0])
+                )
+
+            # 只在素材区域（白色掩码区域）应用颜色叠加
+            # 背景区域（黑色掩码区域）保持不变
+            blended_roi = (
+                canvas_roi.astype(np.float32) * (1 - color_mask)
+                + color_layer.astype(np.float32) * color_mask
+            )
+
+            # 更新画布
+            canvas[y1:y2, x1:x2] = blended_roi.astype(np.uint8)
+
+            return canvas
+
+        except Exception as e:
+            print(f"泊松融合后颜色叠加失败: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return canvas
+
+    def _normal_blend(
+        self,
+        canvas: np.ndarray,
+        src_image: np.ndarray,
+        src_mask: np.ndarray,
+        bbox: Tuple[int, int, int, int],
+    ) -> np.ndarray:
+        """普通混合模式"""
+        try:
+            x1, y1, x2, y2 = bbox
+
+            # 获取画布ROI
+            canvas_roi = canvas[y1:y2, x1:x2]
+
+            # 使用掩码进行混合
+            mask_3d = src_mask.astype(np.float32) / 255.0
+            if len(mask_3d.shape) == 2:
+                mask_3d = np.stack([mask_3d] * 3, axis=2)
+
+            # 混合
+            blended_roi = (
+                canvas_roi.astype(np.float32) * (1 - mask_3d)
+                + src_image.astype(np.float32) * mask_3d
+            )
+
+            # 更新画布
+            canvas[y1:y2, x1:x2] = blended_roi.astype(np.uint8)
+
+            return canvas
+
+        except Exception as e:
+            print(f"普通混合失败: {e}")
+            return canvas
 
     def _poisson_blend(
         self,
@@ -245,18 +433,26 @@ class CanvasWidget(QLabel):
                 y2 = min(dst_h, y2)
 
                 if x1 < x2 and y1 < y2:
-                    # 调整源图像和掩码大小
-                    adj_src = src[: y2 - y1, : x2 - x1]
-                    adj_mask = mask[: y2 - y1, : x2 - x1]
+                    # 计算源图像中对应的区域
+                    src_x1 = max(0, -offset[0])
+                    src_y1 = max(0, -offset[1])
+                    src_x2 = src_x1 + (x2 - x1)
+                    src_y2 = src_y1 + (y2 - y1)
 
-                    # 简单混合
-                    mask_3d = np.stack([adj_mask] * 3, axis=2) > 0
-                    dst[y1:y2, x1:x2][mask_3d] = adj_src[mask_3d]
+                    # 获取对应的区域
+                    dst_roi = dst[y1:y2, x1:x2]
+                    src_roi = src[src_y1:src_y2, src_x1:src_x2]
+                    mask_roi = mask[src_y1:src_y2, src_x1:src_x2]
 
-            except Exception as e2:
-                print(f"回退混合也失败: {e2}")
+                    # 创建三通道掩码
+                    if len(dst_roi.shape) == 3:
+                        mask_3d = np.stack([mask_roi] * 3, axis=2) > 128
+                        dst_roi[mask_3d] = src_roi[mask_3d]
 
-            return dst
+                return dst
+            except Exception as fallback_error:
+                print(f"普通混合也失败: {fallback_error}")
+                return dst
 
     def paintEvent(self, event: QPaintEvent):
         """绘制事件"""
@@ -299,7 +495,7 @@ class CanvasWidget(QLabel):
 
     def _draw_instance_overlay(self, painter: QPainter, instance: MaterialInstance):
         """绘制素材实例的叠加层（边界框等）"""
-        # 使用mask边界框而不是图像边界框
+        # 强制使用掩码边界框来绘制边框，确保边框准确包围可见区域
         x1, y1, x2, y2 = instance.get_mask_bounding_rect()
 
         # 使用统一的坐标转换方法
@@ -416,38 +612,41 @@ class CanvasWidget(QLabel):
     def mousePressEvent(self, event: QMouseEvent):
         """鼠标按下事件"""
         if event.button() == Qt.MouseButton.LeftButton:
+            # 检查是否点击了素材实例
             pos = event.position().toPoint()
             canvas_pos = self._screen_to_canvas_pos(pos)
 
-            # 查找点击的素材实例，增加容差提高选择精度
+            # 查找被点击的素材实例
             clicked_instance = self._get_instance_at_pos_with_tolerance(
                 canvas_pos.x(), canvas_pos.y(), tolerance=5
             )
 
             if clicked_instance:
-                # 选中素材实例
+                # 选择并开始拖拽素材实例
                 self.selected_instance = clicked_instance
                 self.dragging = True
+                self.dragging_instance = clicked_instance  # 新增：记录拖动的实例
                 self.drag_start_pos = pos
                 self.drag_offset = QPoint(
                     canvas_pos.x() - clicked_instance.x,
                     canvas_pos.y() - clicked_instance.y,
                 )
+
+                # 准备增量更新的基础图像
+                self._prepare_base_composite_for_dragging(clicked_instance)
+
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
                 self.instance_selected.emit(clicked_instance)
-                # 不启动单击计时器，因为点击到了素材
-                self.update()
             else:
-                # 点击空白区域，启动双击检测
-                self.pending_click_pos = canvas_pos
-                self.click_timer.start(self.double_click_threshold)
+                # 点击空白区域，触发画布点击事件
+                self.canvas_clicked.emit(canvas_pos.x(), canvas_pos.y())
                 self.selected_instance = None
                 self.instance_selected.emit(None)
-                self.update()
+
         elif event.button() == Qt.MouseButton.RightButton:
-            # 右键始终拖动整个画布视图（背景+素材）
-            pos = event.position().toPoint()
+            # 右键拖动画布
             self.canvas_dragging = True
-            self.drag_start_pos = pos
+            self.drag_start_pos = event.position().toPoint()
             self.canvas_drag_start_offset = self.canvas_offset
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
@@ -475,33 +674,46 @@ class CanvasWidget(QLabel):
 
     def mouseMoveEvent(self, event: QMouseEvent):
         """鼠标移动事件"""
-        if self.canvas_dragging:
-            # 拖动整个画布视图 - 背景和所有素材一起移动
-            current_pos = event.position().toPoint()
-            delta = current_pos - self.drag_start_pos
-            self.canvas_offset = self.canvas_drag_start_offset + delta
-            # 只需要重绘显示，不需要重新合成图像
-            self.update()
-        elif self.dragging and self.selected_instance:
-            # 拖动单个素材实例
-            pos = event.position().toPoint()
+        pos = event.position().toPoint()
+
+        if self.dragging and self.selected_instance:
+            # 拖拽素材实例
             canvas_pos = self._screen_to_canvas_pos(pos)
+            new_x = canvas_pos.x() - self.drag_offset.x()
+            new_y = canvas_pos.y() - self.drag_offset.y()
 
-            # 更新素材位置
-            self.selected_instance.x = canvas_pos.x() - self.drag_offset.x()
-            self.selected_instance.y = canvas_pos.y() - self.drag_offset.y()
+            self.selected_instance.x = new_x
+            self.selected_instance.y = new_y
 
-            # 重新合成图像并更新显示
-            self.update_canvas()
-            self.instance_moved.emit(self.selected_instance)
+            # 使用节流机制更新画布，避免过于频繁的重绘
+            if not self.pending_update:
+                self.pending_update = True
+                self.drag_update_timer.start(16)  # 约60FPS的更新频率
+
+        elif self.canvas_dragging:
+            # 拖拽画布
+            delta = pos - self.drag_start_pos
+            self.canvas_offset = self.canvas_drag_start_offset + delta
+            self.update()  # 画布拖动只需要重绘
 
     def mouseReleaseEvent(self, event: QMouseEvent):
         """鼠标释放事件"""
         if event.button() == Qt.MouseButton.LeftButton:
-            self.dragging = False
+            if self.dragging:
+                self.dragging = False
+                self.dragging_instance = None  # 新增：清除拖动实例记录
+
+                # 拖动结束后进行一次完整更新，确保所有图层正确合成
+                self.update_canvas(force_full_update=True)
+
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+                if self.selected_instance:
+                    self.instance_moved.emit(self.selected_instance)
+
         elif event.button() == Qt.MouseButton.RightButton:
-            self.canvas_dragging = False
-            self.setCursor(Qt.CursorShape.ArrowCursor)
+            if self.canvas_dragging:
+                self.canvas_dragging = False
+                self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def wheelEvent(self, event: QWheelEvent):
         """鼠标滚轮事件（缩放）"""
@@ -645,6 +857,12 @@ class CanvasWidget(QLabel):
         # 这里需要传入MaterialManager实例，暂时返回False
         # 实际使用时需要从主窗口获取MaterialManager
         return False
+
+    def _delayed_canvas_update(self):
+        """延迟的画布更新"""
+        if self.pending_update:
+            self.update_canvas()
+            self.pending_update = False
 
 
 class CanvasScrollArea(QScrollArea):
