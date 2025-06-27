@@ -233,13 +233,19 @@ class MaterialInstance:
         mask_x2 = max(x_coords)
         mask_y2 = max(y_coords)
 
-        # 转换为画布坐标
-        image_x1, image_y1, _, _ = self.get_bounding_rect()
+        # 使用不包含色彩叠加的变换图像来计算尺寸，确保与掩码尺寸一致
+        transformed_image = self._get_transformed_image_without_color()
+        h, w = transformed_image.shape[:2]
 
-        x1 = image_x1 + mask_x1
-        y1 = image_y1 + mask_y1
-        x2 = image_x1 + mask_x2
-        y2 = image_y1 + mask_y2
+        # 变换后图像的左上角在画布中的位置
+        image_left = self.x - w // 2
+        image_top = self.y - h // 2
+
+        # 掩码边界框在画布中的实际位置
+        x1 = image_left + mask_x1
+        y1 = image_top + mask_y1
+        x2 = image_left + mask_x2
+        y2 = image_top + mask_y2
 
         return x1, y1, x2, y2
 
@@ -308,12 +314,19 @@ class MaterialInstance:
         epsilon = 0.005 * cv2.arcLength(largest_contour, True)
         simplified = cv2.approxPolyDP(largest_contour, epsilon, True)
 
-        # 转换为绝对坐标 - 使用图像边界框的左上角
-        image_x1, image_y1, _, _ = self.get_bounding_rect()
+        # 转换为绝对坐标 - 使用不包含色彩叠加的变换图像来计算尺寸，确保与掩码尺寸一致
+        transformed_image = self._get_transformed_image_without_color()
+        h, w = transformed_image.shape[:2]
+
+        # 变换后图像的左上角在画布中的位置
+        image_left = self.x - w // 2
+        image_top = self.y - h // 2
+
         points = []
         for point in simplified:
             px, py = point[0]
-            points.append({"x": int(px + image_x1), "y": int(py + image_y1)})
+            # 掩码坐标转换为画布坐标
+            points.append({"x": int(px + image_left), "y": int(py + image_top)})
 
         return points
 

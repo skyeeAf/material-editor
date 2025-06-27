@@ -199,12 +199,15 @@ class CanvasWidget(QLabel):
                 return canvas
 
             # 计算在画布上的位置
-            x = int(instance.x)
-            y = int(instance.y)
 
             # 获取图像尺寸
             h, w = transformed_image.shape[:2]
             canvas_h, canvas_w = canvas.shape[:2]
+
+            center_x = int(instance.x)
+            center_y = int(instance.y)
+            x = center_x - w // 2  # 转换为左上角坐标
+            y = center_y - h // 2
 
             # 计算实际的绘制区域
             src_x1 = max(0, -x)
@@ -216,6 +219,7 @@ class CanvasWidget(QLabel):
             dst_y1 = max(0, y)
             dst_x2 = min(canvas_w, x + w)
             dst_y2 = min(canvas_h, y + h)
+
 
             # 检查是否有有效的绘制区域
             if (
