@@ -230,26 +230,37 @@ class MaterialInstance:
             if len(transformed_mask.shape) == 3
             else transformed_mask
         )
+
+        # 创建二值掩码，使用更合适的阈值
+        _, binary_mask = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
+
         contours, _ = cv2.findContours(
-            gray, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_KCOS
+            binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_KCOS
         )
 
         if not contours:
-            return []
+            # 如果没有找到轮廓，返回图像边界框的四个角点
+            x1, y1, x2, y2 = self.get_bounding_rect()
+            return [
+                {"x": x1, "y": y1},
+                {"x": x2, "y": y1},
+                {"x": x2, "y": y2},
+                {"x": x1, "y": y2},
+            ]
 
         # 选择最大的轮廓
         largest_contour = max(contours, key=cv2.contourArea)
 
-        # 简化轮廓
-        epsilon = 0.02 * cv2.arcLength(largest_contour, True)
+        # 简化轮廓 - 使用更精细的参数来保留更多细节
+        epsilon = 0.005 * cv2.arcLength(largest_contour, True)
         simplified = cv2.approxPolyDP(largest_contour, epsilon, True)
 
-        # 转换为绝对坐标
-        x1, y1, _, _ = self.get_bounding_rect()
+        # 转换为绝对坐标 - 使用图像边界框的左上角
+        image_x1, image_y1, _, _ = self.get_bounding_rect()
         points = []
         for point in simplified:
             px, py = point[0]
-            points.append({"x": int(px + x1), "y": int(py + y1)})
+            points.append({"x": int(px + image_x1), "y": int(py + image_y1)})
 
         return points
 

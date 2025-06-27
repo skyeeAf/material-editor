@@ -40,7 +40,7 @@ class MaterialEditor(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("素材编辑器")
-        self.setGeometry(100, 100, 1400, 900)
+        self.setGeometry(100, 100, 1200, 900)
 
         # 核心组件
         self.material_manager = MaterialManager()
@@ -564,7 +564,8 @@ class MaterialEditor(QMainWindow):
             group_id = 1
             for i, instance in enumerate(instances):
                 if instance.visible:
-                    x1, y1, x2, y2 = instance.get_bounding_rect()
+                    # 使用mask边界而不是图像边界
+                    x1, y1, x2, y2 = instance.get_mask_bounding_rect()
 
                     # 计算边界框的中心点和尺寸
                     width = x2 - x1
@@ -572,13 +573,13 @@ class MaterialEditor(QMainWindow):
                     center_x = x1 + width / 2
                     center_y = y1 + height / 2
 
-                    # 创建矩形分割段（四个角的坐标）
-                    segment = [
-                        {"x": float(x1), "y": float(y1)},  # 左上角
-                        {"x": float(x2), "y": float(y1)},  # 右上角
-                        {"x": float(x2), "y": float(y2)},  # 右下角
-                        {"x": float(x1), "y": float(y2)},  # 左下角
-                    ]
+                    # 获取mask轮廓的所有点坐标
+                    segment_points = instance.get_segment_points()
+
+                    # 转换为所需格式
+                    segment = []
+                    for point in segment_points:
+                        segment.append({"x": float(point["x"]), "y": float(point["y"])})
 
                     instance_data = {
                         "category": instance.material_name,

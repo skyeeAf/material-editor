@@ -299,8 +299,8 @@ class CanvasWidget(QLabel):
 
     def _draw_instance_overlay(self, painter: QPainter, instance: MaterialInstance):
         """绘制素材实例的叠加层（边界框等）"""
-        # 使用正确的边界框方法 - 改为使用get_bounding_rect而不是get_mask_bounding_rect
-        x1, y1, x2, y2 = instance.get_bounding_rect()
+        # 使用mask边界框而不是图像边界框
+        x1, y1, x2, y2 = instance.get_mask_bounding_rect()
 
         # 使用统一的坐标转换方法
         top_left_screen = self._canvas_to_screen_pos(QPoint(int(x1), int(y1)))
