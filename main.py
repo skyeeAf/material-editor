@@ -7,7 +7,7 @@
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap
@@ -52,6 +52,10 @@ class MaterialEditor(QMainWindow):
         self.current_background_path: Optional[str] = None
         self.is_modified = False
         self.current_selected_material: Optional[str] = None  # 当前选择的素材路径
+
+        # 背景图像管理
+        self.background_images: List[str] = []  # 背景图像路径列表
+        self.current_background_index: int = 0  # 当前背景图像索引
 
         # 添加模式：'click' 或 'double_click'
         self.add_mode = "double_click"
@@ -102,15 +106,22 @@ class MaterialEditor(QMainWindow):
         # 文件菜单
         file_menu = menubar.addMenu("文件(&F)")
 
-        # 加载背景图像
-        load_bg_action = QAction("加载背景图像(&B)", self)
-        load_bg_action.triggered.connect(self.load_background)
+        # 加载背景目录
+        load_bg_action = QAction("加载背景目录(&B)", self)
+        load_bg_action.triggered.connect(self.load_background_directory)
         file_menu.addAction(load_bg_action)
 
         # 加载素材目录
         load_materials_action = QAction("加载素材目录(&M)", self)
         load_materials_action.triggered.connect(self.load_materials)
         file_menu.addAction(load_materials_action)
+
+        file_menu.addSeparator()
+
+        # 清空所有素材
+        clear_materials_action = QAction("清空所有素材(&C)", self)
+        clear_materials_action.triggered.connect(self.clear_all_materials)
+        file_menu.addAction(clear_materials_action)
 
         file_menu.addSeparator()
 
@@ -188,15 +199,34 @@ class MaterialEditor(QMainWindow):
         toolbar = QToolBar("主工具栏")
         self.addToolBar(toolbar)
 
-        # 加载背景
-        load_bg_action = QAction("加载背景", self)
-        load_bg_action.triggered.connect(self.load_background)
+        # 加载背景目录
+        load_bg_action = QAction("加载背景目录", self)
+        load_bg_action.triggered.connect(self.load_background_directory)
         toolbar.addAction(load_bg_action)
+
+        # 上一张背景
+        self.prev_bg_action = QAction("上一张背景", self)
+        self.prev_bg_action.triggered.connect(self.prev_background)
+        self.prev_bg_action.setEnabled(False)
+        toolbar.addAction(self.prev_bg_action)
+
+        # 下一张背景
+        self.next_bg_action = QAction("下一张背景", self)
+        self.next_bg_action.triggered.connect(self.next_background)
+        self.next_bg_action.setEnabled(False)
+        toolbar.addAction(self.next_bg_action)
+
+        toolbar.addSeparator()
 
         # 加载素材
         load_materials_action = QAction("加载素材", self)
         load_materials_action.triggered.connect(self.load_materials)
         toolbar.addAction(load_materials_action)
+
+        # 清空素材
+        clear_materials_action = QAction("清空素材", self)
+        clear_materials_action.triggered.connect(self.clear_all_materials)
+        toolbar.addAction(clear_materials_action)
 
         toolbar.addSeparator()
 
@@ -364,9 +394,11 @@ class MaterialEditor(QMainWindow):
             # 自动选中对应的图层
             if selected_instance.layer_id:
                 # 切换到图层标签页
-                self.control_panel.set_active_tab("图层")
+                # self.control_panel.set_active_tab("图层")
                 # 在图层树中选中对应的图层
                 self.control_panel.select_layer(selected_instance.layer_id)
+                # 自动切换到属性页面
+                self.control_panel.set_active_tab("属性")
 
     def _on_canvas_modified(self):
         """画布修改事件"""
@@ -443,13 +475,20 @@ class MaterialEditor(QMainWindow):
         """更新窗口标题"""
         title = "素材编辑器"
         if self.current_background_path:
-            title += f" - {Path(self.current_background_path).name}"
+            filename = Path(self.current_background_path).name
+            if len(self.background_images) > 1:
+                # 显示当前图像索引
+                current_index = self.current_background_index + 1
+                total_count = len(self.background_images)
+                title += f" - {filename} ({current_index}/{total_count})"
+            else:
+                title += f" - {filename}"
         if self.is_modified:
             title += " *"
         self.setWindowTitle(title)
 
     def load_background(self):
-        """加载背景图像"""
+        """加载单张背景图像（兼容性方法）"""
         file_path, _ = QFileDialog.getOpenFileName(
             self, "选择背景图像", "", "图像文件 (*.png *.jpg *.jpeg *.bmp *.tiff)"
         )
@@ -463,12 +502,32 @@ class MaterialEditor(QMainWindow):
                     np.fromfile(file_path, dtype=np.uint8), cv2.IMREAD_COLOR
                 )
                 if image is not None:
+                    # 将单张图像作为背景图像列表
+                    self.background_images = [file_path]
+                    self.current_background_index = 0
+
+                    # 自动清空所有素材
+                    self.layer_manager.clear_all_layers()
+
+                    # 清除画布选择
+                    self.canvas_area.canvas.selected_instance = None
+
+                    # 设置背景图像
                     self.canvas_area.canvas.set_background_image(image)
                     self.current_background_path = file_path
                     self.is_modified = True
                     self.current_selected_material = None
+
+                    # 适应窗口大小
+                    self.canvas_area.canvas.zoom_to_fit()
+
+                    # 更新界面
                     self._update_window_title()
-                    self.status_label.setText("背景图像加载成功")
+                    self._update_background_navigation_buttons()
+                    self.control_panel.refresh_layers()
+                    self.control_panel.set_current_instance(None)
+
+                    self.status_label.setText("背景图像加载成功，已清空素材并适应窗口")
                 else:
                     QMessageBox.warning(self, "警告", "无法加载图像文件")
             except Exception as e:
@@ -498,28 +557,41 @@ class MaterialEditor(QMainWindow):
             QMessageBox.warning(self, "警告", "没有素材实例可导出")
             return
 
-        # 让用户选择基础文件名
-        base_file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "选择导出文件基础名称",
-            "",
-            "PNG文件 (*.png);;JPEG文件 (*.jpg);;所有文件 (*.*)",
-        )
+        # 让用户选择导出目录
+        export_dir = QFileDialog.getExistingDirectory(self, "选择导出目录")
 
-        if not base_file_path:
+        if not export_dir:
             return
 
         try:
-            # 获取基础文件名（不含扩展名）
+            import os
             from pathlib import Path
 
-            base_path = Path(base_file_path)
-            base_name = base_path.stem
-            base_dir = base_path.parent
+            # 获取源文件名（不含扩展名）
+            if self.current_background_path:
+                source_filename = Path(self.current_background_path).stem
+            else:
+                source_filename = "image"
 
-            # 生成图像和标注文件路径
-            image_path = base_dir / f"{base_name}.png"
-            annotation_path = base_dir / f"{base_name}.json"
+            # 生成唯一的文件名
+            def get_unique_filename(
+                base_dir: str, base_name: str, extension: str
+            ) -> Tuple[str, str]:
+                """生成唯一的文件名"""
+                index = 1
+                while True:
+                    filename = f"FAKE_{base_name}_{index}"
+                    image_path = os.path.join(base_dir, f"{filename}.{extension}")
+                    json_path = os.path.join(base_dir, f"{filename}.json")
+
+                    if not os.path.exists(image_path) and not os.path.exists(json_path):
+                        return image_path, json_path
+                    index += 1
+
+            # 生成唯一的文件路径
+            image_path, annotation_path = get_unique_filename(
+                export_dir, source_filename, "jpg"
+            )
 
             # 导出图像
             import cv2
@@ -534,8 +606,10 @@ class MaterialEditor(QMainWindow):
                         canvas_image, instance
                     )
 
-            # 保存图像
-            success = cv2.imwrite(str(image_path), canvas_image)
+            # 保存为JPG格式，设置质量参数
+            success = cv2.imwrite(
+                image_path, canvas_image, [cv2.IMWRITE_JPEG_QUALITY, 95]
+            )
 
             if not success:
                 QMessageBox.critical(self, "错误", "导出图像失败")
@@ -543,14 +617,13 @@ class MaterialEditor(QMainWindow):
 
             # 导出标注
             import json
-            import os
 
             # 构建标注数据 - 使用AnyMark格式
             annotations = {
                 "info": {
                     "description": "AnyMark",
-                    "folder": str(base_dir),
-                    "name": image_path.name,
+                    "folder": export_dir,
+                    "name": Path(image_path).name,
                     "width": self.canvas_area.canvas.background_image.shape[1],
                     "height": self.canvas_area.canvas.background_image.shape[0],
                     "depth": 3,
@@ -606,8 +679,12 @@ class MaterialEditor(QMainWindow):
             with open(annotation_path, "w", encoding="utf-8") as f:
                 json.dump(annotations, f, ensure_ascii=False, indent=2)
 
+            # 获取文件名用于显示
+            image_filename = Path(image_path).name
+            annotation_filename = Path(annotation_path).name
+
             self.status_label.setText(
-                f"导出成功：图像({image_path.name})、标注({annotation_path.name})"
+                f"导出成功：图像({image_filename})、标注({annotation_filename})"
             )
             QMessageBox.information(
                 self,
@@ -883,6 +960,147 @@ class MaterialEditor(QMainWindow):
                 import traceback
 
                 traceback.print_exc()
+
+    def load_background_directory(self):
+        """加载背景图像目录"""
+        dir_path = QFileDialog.getExistingDirectory(self, "选择背景图像目录")
+
+        if dir_path:
+            try:
+                import os
+
+                # 支持的图像格式
+                image_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
+
+                # 获取目录中的所有图像文件
+                image_files = []
+                for file in os.listdir(dir_path):
+                    if any(file.lower().endswith(ext) for ext in image_extensions):
+                        image_files.append(os.path.join(dir_path, file))
+
+                if not image_files:
+                    QMessageBox.warning(self, "警告", "目录中没有找到图像文件")
+                    return
+
+                # 按文件名排序
+                image_files.sort()
+
+                self.background_images = image_files
+                self.current_background_index = 0
+
+                # 加载第一张图像（会自动清空素材并适应窗口）
+                self._load_background_by_index(0)
+
+                # 更新按钮状态
+                self._update_background_navigation_buttons()
+
+                self.status_label.setText(
+                    f"加载了 {len(image_files)} 张背景图像，已清空素材"
+                )
+
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"加载背景图像目录失败: {str(e)}")
+
+    def prev_background(self):
+        """切换到上一张背景图像"""
+        if self.background_images and self.current_background_index > 0:
+            self.current_background_index -= 1
+            self._load_background_by_index(self.current_background_index)
+            self._update_background_navigation_buttons()
+
+    def next_background(self):
+        """切换到下一张背景图像"""
+        if (
+            self.background_images
+            and self.current_background_index < len(self.background_images) - 1
+        ):
+            self.current_background_index += 1
+            self._load_background_by_index(self.current_background_index)
+            self._update_background_navigation_buttons()
+
+    def _load_background_by_index(self, index: int):
+        """根据索引加载背景图像"""
+        if 0 <= index < len(self.background_images):
+            file_path = self.background_images[index]
+            try:
+                import cv2
+                import numpy as np
+
+                image = cv2.imdecode(
+                    np.fromfile(file_path, dtype=np.uint8), cv2.IMREAD_COLOR
+                )
+                if image is not None:
+                    # 自动清空所有素材
+                    self.layer_manager.clear_all_layers()
+
+                    # 清除画布选择
+                    self.canvas_area.canvas.selected_instance = None
+
+                    # 设置新的背景图像
+                    self.canvas_area.canvas.set_background_image(image)
+                    self.current_background_path = file_path
+                    self.is_modified = True
+                    self.current_selected_material = None
+
+                    # 适应窗口大小
+                    self.canvas_area.canvas.zoom_to_fit()
+
+                    # 更新界面
+                    self._update_window_title()
+                    self.control_panel.refresh_layers()
+                    self.control_panel.set_current_instance(None)
+
+                    # 更新状态栏显示当前图像信息
+                    filename = Path(file_path).name
+                    self.status_label.setText(
+                        f"背景图像: {filename} ({index + 1}/{len(self.background_images)}) - 已清空素材并适应窗口"
+                    )
+                else:
+                    QMessageBox.warning(self, "警告", f"无法加载图像文件: {file_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"加载背景图像失败: {str(e)}")
+
+    def _update_background_navigation_buttons(self):
+        """更新背景图像导航按钮状态"""
+        has_images = len(self.background_images) > 0
+        can_go_prev = has_images and self.current_background_index > 0
+        can_go_next = (
+            has_images
+            and self.current_background_index < len(self.background_images) - 1
+        )
+
+        self.prev_bg_action.setEnabled(can_go_prev)
+        self.next_bg_action.setEnabled(can_go_next)
+
+    def clear_all_materials(self):
+        """清空所有素材"""
+        reply = QMessageBox.question(
+            self,
+            "确认清空",
+            "确定要清空所有素材吗？此操作不可撤销。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            # 清空图层管理器中的所有实例
+            self.layer_manager.clear_all_layers()
+
+            # 清除画布选择
+            self.canvas_area.canvas.selected_instance = None
+
+            # 更新画布显示
+            self.canvas_area.canvas.update_canvas()
+
+            # 刷新控制面板
+            self.control_panel.refresh_layers()
+            self.control_panel.set_current_instance(None)
+
+            # 标记为已修改
+            self.is_modified = True
+            self._update_window_title()
+
+            self.status_label.setText("已清空所有素材")
 
 
 def main():
