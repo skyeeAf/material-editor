@@ -84,28 +84,94 @@ def numpy_to_qimage(image: np.ndarray):
     try:
         from PySide6.QtGui import QImage
 
+        if image is None or image.size == 0:
+            print("警告：输入图像为空")
+            return None
+
+        # 确保数组是连续的
+        if not image.flags["C_CONTIGUOUS"]:
+            image = np.ascontiguousarray(image)
+
         if len(image.shape) == 3:
             h, w, ch = image.shape
+
+            # 检查尺寸有效性
+            if h <= 0 or w <= 0 or ch <= 0:
+                print(f"警告：图像尺寸无效 {w}x{h}x{ch}")
+                return None
+
             bytes_per_line = ch * w
 
             # OpenCV使用BGR，Qt使用RGB
             if ch == 3:
-                rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                return QImage(
-                    rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888
-                )
+                try:
+                    rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    # 确保转换后的图像也是连续的
+                    if not rgb_image.flags["C_CONTIGUOUS"]:
+                        rgb_image = np.ascontiguousarray(rgb_image)
+
+                    qimage = QImage(
+                        rgb_image.data,
+                        w,
+                        h,
+                        bytes_per_line,
+                        QImage.Format.Format_RGB888,
+                    )
+                    # 创建QImage的深拷贝，避免数据被释放
+                    return qimage.copy()
+                except Exception as e:
+                    print(f"BGR到RGB转换失败: {e}")
+                    return None
+
             elif ch == 4:
-                rgba_image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA)
-                return QImage(
-                    rgba_image.data, w, h, bytes_per_line, QImage.Format.Format_RGBA8888
-                )
+                try:
+                    rgba_image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA)
+                    # 确保转换后的图像也是连续的
+                    if not rgba_image.flags["C_CONTIGUOUS"]:
+                        rgba_image = np.ascontiguousarray(rgba_image)
+
+                    qimage = QImage(
+                        rgba_image.data,
+                        w,
+                        h,
+                        bytes_per_line,
+                        QImage.Format.Format_RGBA8888,
+                    )
+                    # 创建QImage的深拷贝，避免数据被释放
+                    return qimage.copy()
+                except Exception as e:
+                    print(f"BGRA到RGBA转换失败: {e}")
+                    return None
+            else:
+                print(f"不支持的通道数: {ch}")
+                return None
+
         elif len(image.shape) == 2:
             h, w = image.shape
-            return QImage(image.data, w, h, w, QImage.Format.Format_Grayscale8)
+
+            # 检查尺寸有效性
+            if h <= 0 or w <= 0:
+                print(f"警告：灰度图像尺寸无效 {w}x{h}")
+                return None
+
+            try:
+                qimage = QImage(image.data, w, h, w, QImage.Format.Format_Grayscale8)
+                # 创建QImage的深拷贝，避免数据被释放
+                return qimage.copy()
+            except Exception as e:
+                print(f"灰度图像转换失败: {e}")
+                return None
+        else:
+            print(f"不支持的图像维度: {len(image.shape)}")
+            return None
+
     except ImportError:
-        print("PyQt6未安装，无法转换为QImage")
+        print("PySide6未安装，无法转换为QImage")
     except Exception as e:
         print(f"转换为QImage失败: {e}")
+        import traceback
+
+        traceback.print_exc()
 
     return None
 

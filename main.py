@@ -32,9 +32,9 @@ from PySide6.QtWidgets import (
 from core.export import ProjectExporter
 from core.layer import LayerManager
 from core.material import MaterialManager
-from ui.canvas import CanvasScrollArea
 from ui.controls import ControlPanel
 from ui.dialogs import RandomGenerateDialog
+from ui.graphics_canvas import HighPerformanceCanvasWidget
 from utils.file_utils import FileManager
 
 
@@ -95,9 +95,9 @@ class MaterialEditor(QMainWindow):
         self.control_panel.setMaximumWidth(400)
         splitter.addWidget(self.control_panel)
 
-        # 右侧画布区域
-        self.canvas_area = CanvasScrollArea()
-        self.canvas_area.canvas.set_layer_manager(self.layer_manager)
+        # 右侧画布区域 - 使用新的高性能画布
+        self.canvas_area = HighPerformanceCanvasWidget()
+        self.canvas_area.set_layer_manager(self.layer_manager)
         splitter.addWidget(self.canvas_area)
 
         # 设置分割器比例
@@ -189,14 +189,12 @@ class MaterialEditor(QMainWindow):
 
         # 适应窗口
         fit_action = QAction("适应窗口(&F)", self)
-        fit_action.triggered.connect(self.canvas_area.canvas.zoom_to_fit)
+        fit_action.triggered.connect(self.canvas_area.zoom_to_fit)
         view_menu.addAction(fit_action)
 
         # 实际大小
         actual_size_action = QAction("实际大小(&A)", self)
-        actual_size_action.triggered.connect(
-            self.canvas_area.canvas.zoom_to_actual_size
-        )
+        actual_size_action.triggered.connect(self.canvas_area.zoom_to_actual_size)
         view_menu.addAction(actual_size_action)
 
         view_menu.addSeparator()
@@ -273,7 +271,7 @@ class MaterialEditor(QMainWindow):
 
         # 适应窗口
         fit_action = QAction("适应窗口", self)
-        fit_action.triggered.connect(self.canvas_area.canvas.zoom_to_fit)
+        fit_action.triggered.connect(self.canvas_area.zoom_to_fit)
         toolbar.addAction(fit_action)
 
     def _init_statusbar(self):
@@ -304,12 +302,10 @@ class MaterialEditor(QMainWindow):
     def _connect_signals(self):
         """连接信号槽"""
         # 画布信号
-        self.canvas_area.canvas.instance_selected.connect(self._on_selection_changed)
-        self.canvas_area.canvas.instance_moved.connect(self._on_canvas_modified)
-        self.canvas_area.canvas.canvas_clicked.connect(self._on_canvas_clicked)
-        self.canvas_area.canvas.canvas_double_clicked.connect(
-            self._on_canvas_double_clicked
-        )
+        self.canvas_area.instance_selected.connect(self._on_selection_changed)
+        self.canvas_area.instance_moved.connect(self._on_canvas_modified)
+        self.canvas_area.canvas_clicked.connect(self._on_canvas_clicked)
+        self.canvas_area.canvas_double_clicked.connect(self._on_canvas_double_clicked)
 
         # 控制面板信号
         self.control_panel.material_selected.connect(self._on_material_selected)
@@ -381,13 +377,13 @@ class MaterialEditor(QMainWindow):
                         print(f"当前图层实例数量: {len(current_layer.instances)}")
 
                     # 更新画布
-                    self.canvas_area.canvas.update_canvas()
+                    self.canvas_area.update_canvas()
 
                     # 刷新图层面板显示
                     self.control_panel.refresh_layers()
 
                     # 设置为选中状态
-                    self.canvas_area.canvas.selected_instance = instance
+                    self.canvas_area.selected_instance = instance
 
                     # 标记项目已修改
                     self.is_modified = True
@@ -419,25 +415,38 @@ class MaterialEditor(QMainWindow):
 
     def _on_selection_changed(self):
         """选择改变事件"""
-        selected_instance = self.canvas_area.canvas.selected_instance
-        if selected_instance is None:
-            self.status_label.setText(
-                "就绪 - 左键点击/拖动素材，右键拖动画布，滚轮以鼠标为中心缩放"
-            )
-        else:
-            self.status_label.setText(
-                f"已选择素材: {selected_instance.material_name} - 可拖动或使用快捷键调整"
-            )
+        try:
+            # 获取当前选择的实例
+            selected_item = None
+            selected_instance = None
+
+            # 从graphics_view获取选择的项目
+            if hasattr(self.canvas_area, "graphics_view"):
+                selected_items = self.canvas_area.graphics_view.scene.selectedItems()
+                if selected_items:
+                    selected_item = selected_items[0]
+                    if hasattr(selected_item, "instance"):
+                        selected_instance = selected_item.instance
+
+            # 更新控制面板
             self.control_panel.set_current_instance(selected_instance)
 
-            # 自动选中对应的图层
-            if selected_instance.layer_id:
-                # 切换到图层标签页
-                # self.control_panel.set_active_tab("图层")
-                # 在图层树中选中对应的图层
-                self.control_panel.select_layer(selected_instance.layer_id)
-                # 自动切换到属性页面
-                self.control_panel.set_active_tab("属性")
+            # 更新状态栏
+            if selected_instance:
+                self.status_label.setText(
+                    f"已选择素材: {selected_instance.material_info.name} "
+                    f"位置: ({selected_instance.x}, {selected_instance.y}) "
+                    f"缩放: {selected_instance.scale:.2f} "
+                    f"旋转: {selected_instance.rotation:.1f}°"
+                )
+            else:
+                self.status_label.setText("未选择素材")
+
+        except Exception as e:
+            print(f"选择改变事件处理失败: {e}")
+            import traceback
+
+            traceback.print_exc()
 
     def _on_canvas_modified(self):
         """画布修改事件"""
@@ -461,21 +470,45 @@ class MaterialEditor(QMainWindow):
                 layer = self.layer_manager.get_layer(int(layer_id))
                 if layer:
                     layer.visible = visible
-                    self.canvas_area.canvas.update_canvas()
+                    self.canvas_area.update_canvas()
         except (ValueError, TypeError) as e:
             print(f"图层可见性改变失败: {e}, layer_id='{layer_id}'")
 
     def _on_property_changed(self, group: str, property_name: str, value):
         """素材属性改变事件"""
         try:
-            selected_instance = self.canvas_area.canvas.selected_instance
+            # 获取当前选择的实例
+            selected_instance = None
+            if hasattr(self.canvas_area, "graphics_view"):
+                selected_items = self.canvas_area.graphics_view.scene.selectedItems()
+                if selected_items and hasattr(selected_items[0], "instance"):
+                    selected_instance = selected_items[0].instance
+
             if selected_instance:
                 # 更新素材实例属性
                 if group == "position":
                     if property_name == "x":
                         selected_instance.x = value
+                        # 更新图形项位置
+                        if hasattr(self.canvas_area, "graphics_view"):
+                            for (
+                                instance,
+                                item,
+                            ) in self.canvas_area.graphics_view.material_items.items():
+                                if instance == selected_instance:
+                                    item.setPos(value, selected_instance.y)
+                                    break
                     elif property_name == "y":
                         selected_instance.y = value
+                        # 更新图形项位置
+                        if hasattr(self.canvas_area, "graphics_view"):
+                            for (
+                                instance,
+                                item,
+                            ) in self.canvas_area.graphics_view.material_items.items():
+                                if instance == selected_instance:
+                                    item.setPos(selected_instance.x, value)
+                                    break
                 elif group == "transform":
                     if property_name == "scale":
                         selected_instance.scale = value
@@ -499,8 +532,13 @@ class MaterialEditor(QMainWindow):
                     if property_name == "opacity":
                         selected_instance.overlay_opacity = value
 
-                # 更新画布显示
-                self.canvas_area.canvas.update_canvas(force_full_update=True)
+                # 使用新的实时更新方法
+                if hasattr(self.canvas_area, "update_instance_display"):
+                    # 使用高性能组件的实时更新
+                    self.canvas_area.update_instance_display(selected_instance)
+                else:
+                    # 回退到完整更新
+                    self.canvas_area.update_canvas(force_full_update=True)
 
                 # 标记项目已修改
                 self.is_modified = True
@@ -511,14 +549,18 @@ class MaterialEditor(QMainWindow):
         except Exception as e:
             print(f"更新素材属性失败: {e}")
             import traceback
-
             traceback.print_exc()
 
     def _update_status(self):
         """更新状态栏"""
         # 更新缩放比例
-        scale = self.canvas_area.canvas.zoom_factor
-        self.zoom_label.setText(f"缩放: {scale * 100:.0f}%")
+        if hasattr(self.canvas_area, "graphics_view"):
+            # 获取QGraphicsView的变换矩阵
+            transform = self.canvas_area.graphics_view.transform()
+            scale = transform.m11()  # 水平缩放因子
+            self.zoom_label.setText(f"缩放: {scale * 100:.0f}%")
+        else:
+            self.zoom_label.setText("缩放: 100%")
 
     def _update_window_title(self):
         """更新窗口标题"""
@@ -553,13 +595,13 @@ class MaterialEditor(QMainWindow):
                 )
 
                 if image is not None:
-                    self.canvas_area.canvas.set_background_image(image)
+                    self.canvas_area.set_background_image(image)
 
                     # 设置取色器的背景图像
                     self.control_panel.property_widget.set_background_image(image)
 
                     # 更新画布显示
-                    self.canvas_area.canvas.update_canvas()
+                    self.canvas_area.update_canvas()
                     print(f"背景图像加载成功: {file_path}")
                 else:
                     QMessageBox.warning(self, "错误", "无法加载图像文件")
@@ -567,7 +609,6 @@ class MaterialEditor(QMainWindow):
                 QMessageBox.critical(self, "错误", f"加载背景图像失败：{str(e)}")
                 print(f"加载背景图像失败: {e}")
                 import traceback
-
                 traceback.print_exc()
 
     def load_materials(self):
@@ -586,7 +627,7 @@ class MaterialEditor(QMainWindow):
 
     def export_all(self):
         """一键导出图像和标注"""
-        if self.canvas_area.canvas.background_image is None:
+        if self.canvas_area.background_image is None:
             QMessageBox.warning(self, "警告", "请先加载背景图像")
             return
 
@@ -633,13 +674,13 @@ class MaterialEditor(QMainWindow):
             # 导出图像
             import cv2
 
-            canvas_image = self.canvas_area.canvas.background_image.copy()
+            canvas_image = self.canvas_area.background_image.copy()
 
             # 绘制所有可见的素材实例
             instances = self.layer_manager.get_all_instances()
             for instance in instances:
                 if instance.visible:
-                    canvas_image = self.canvas_area.canvas._draw_instance_on_canvas(
+                    canvas_image = self.canvas_area._draw_instance_on_canvas(
                         canvas_image, instance
                     )
 
@@ -661,8 +702,8 @@ class MaterialEditor(QMainWindow):
                     "description": "AnyMark",
                     "folder": export_dir,
                     "name": Path(image_path).name,
-                    "width": self.canvas_area.canvas.background_image.shape[1],
-                    "height": self.canvas_area.canvas.background_image.shape[0],
+                    "width": self.canvas_area.background_image.shape[1],
+                    "height": self.canvas_area.background_image.shape[0],
                     "depth": 3,
                     "note": "",
                 },
@@ -732,7 +773,6 @@ class MaterialEditor(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"导出失败: {str(e)}")
             import traceback
-
             traceback.print_exc()
 
     def show_about(self):
@@ -748,14 +788,14 @@ class MaterialEditor(QMainWindow):
 
     def delete_selected(self):
         """删除选中的素材实例"""
-        selected_instance = self.canvas_area.canvas.selected_instance
+        selected_instance = self.canvas_area.selected_instance
         if selected_instance:
             # 从图层管理器中删除实例
             self.layer_manager.remove_instance(selected_instance)
             # 清除画布选择
-            self.canvas_area.canvas.selected_instance = None
+            self.canvas_area.selected_instance = None
             # 更新画布显示
-            self.canvas_area.canvas.update_canvas()
+            self.canvas_area.update_canvas()
             # 刷新图层面板
             self.control_panel.refresh_layers()
             # 更新属性编辑器
@@ -776,7 +816,7 @@ class MaterialEditor(QMainWindow):
         try:
             # 实例的可见性已经在图层树组件中更新了
             # 这里只需要更新画布显示
-            self.canvas_area.canvas.update_canvas()
+            self.canvas_area.update_canvas()
             self.is_modified = True
             self._update_window_title()
         except Exception as e:
@@ -786,14 +826,14 @@ class MaterialEditor(QMainWindow):
         """键盘事件处理"""
         # Delete键删除选中的素材实例
         if event.key() == Qt.Key.Key_Delete:
-            selected_instance = self.canvas_area.canvas.selected_instance
+            selected_instance = self.canvas_area.selected_instance
             if selected_instance:
                 # 从图层管理器中删除实例
                 self.layer_manager.remove_instance(selected_instance)
                 # 清除画布选择
-                self.canvas_area.canvas.selected_instance = None
+                self.canvas_area.selected_instance = None
                 # 更新画布显示
-                self.canvas_area.canvas.update_canvas()
+                self.canvas_area.update_canvas()
                 # 刷新图层面板
                 self.control_panel.refresh_layers()
                 # 更新属性编辑器
@@ -810,7 +850,7 @@ class MaterialEditor(QMainWindow):
                 return
 
         # 全局快捷键处理：只有在选中素材实例时才响应
-        selected_instance = self.canvas_area.canvas.selected_instance
+        selected_instance = self.canvas_area.selected_instance
         if selected_instance:
             key = event.key()
             modifiers = event.modifiers()
@@ -868,7 +908,7 @@ class MaterialEditor(QMainWindow):
 
             if changed:
                 # 更新画布显示
-                self.canvas_area.canvas.update_canvas()
+                self.canvas_area.update_canvas()
                 # 更新属性编辑器显示
                 self.control_panel.property_widget._update_values_only()
                 # 标记为已修改
@@ -884,23 +924,21 @@ class MaterialEditor(QMainWindow):
         """通知属性改变（内部调用）"""
         # 清除变换缓存
         if group == "transform":
-            selected_instance = self.canvas_area.canvas.selected_instance
+            selected_instance = self.canvas_area.selected_instance
             if selected_instance:
                 selected_instance._transformed_image_cache = None
                 selected_instance._transformed_mask_cache = None
                 selected_instance._transform_cache_key = None
 
         # 更新画布显示
-        self.canvas_area.canvas.update_canvas(force_full_update=True)
+        self.canvas_area.update_canvas(force_full_update=True)
 
         # 更新属性编辑器显示
-        self.control_panel.set_current_instance(
-            self.canvas_area.canvas.selected_instance
-        )
+        self.control_panel.set_current_instance(self.canvas_area.selected_instance)
 
     def export_image(self):
         """导出图像（兼容性方法）"""
-        if self.canvas_area.canvas.background_image is None:
+        if self.canvas_area.background_image is None:
             QMessageBox.warning(self, "警告", "请先加载背景图像")
             return
 
@@ -916,17 +954,15 @@ class MaterialEditor(QMainWindow):
                 import cv2
 
                 # 获取当前的合成图像
-                canvas_image = self.canvas_area.canvas.background_image.copy()
+                canvas_image = self.canvas_area.background_image.copy()
 
                 # 绘制所有可见的素材实例
                 if self.layer_manager:
                     instances = self.layer_manager.get_all_instances()
                     for instance in instances:
                         if instance.visible:
-                            canvas_image = (
-                                self.canvas_area.canvas._draw_instance_on_canvas(
-                                    canvas_image, instance
-                                )
+                            canvas_image = self.canvas_area._draw_instance_on_canvas(
+                                canvas_image, instance
                             )
 
                 # 保存图像
@@ -940,7 +976,6 @@ class MaterialEditor(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"导出图像失败: {str(e)}")
                 import traceback
-
                 traceback.print_exc()
 
     def export_annotation(self):
@@ -960,11 +995,11 @@ class MaterialEditor(QMainWindow):
                 # 构建标注数据
                 annotations = {
                     "image_info": {
-                        "width": self.canvas_area.canvas.background_image.shape[1]
-                        if self.canvas_area.canvas.background_image is not None
+                        "width": self.canvas_area.background_image.shape[1]
+                        if self.canvas_area.background_image is not None
                         else 0,
-                        "height": self.canvas_area.canvas.background_image.shape[0]
-                        if self.canvas_area.canvas.background_image is not None
+                        "height": self.canvas_area.background_image.shape[0]
+                        if self.canvas_area.background_image is not None
                         else 0,
                         "background_path": self.current_background_path,
                     },
@@ -1005,7 +1040,6 @@ class MaterialEditor(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"导出标注失败: {str(e)}")
                 import traceback
-
                 traceback.print_exc()
 
     def load_background_directory(self):
@@ -1067,22 +1101,27 @@ class MaterialEditor(QMainWindow):
         """根据索引加载背景图像"""
         if 0 <= index < len(self.background_images):
             file_path = self.background_images[index]
+            self.current_background_index = index
+
             try:
                 import cv2
                 import numpy as np
 
+                # 加载图像
                 image = cv2.imdecode(
                     np.fromfile(file_path, dtype=np.uint8), cv2.IMREAD_COLOR
                 )
+
                 if image is not None:
                     # 自动清空所有素材
                     self.layer_manager.clear_all_layers()
 
                     # 清除画布选择
-                    self.canvas_area.canvas.selected_instance = None
+                    if hasattr(self.canvas_area, "graphics_view"):
+                        self.canvas_area.graphics_view.scene.clearSelection()
 
                     # 设置新的背景图像
-                    self.canvas_area.canvas.set_background_image(image)
+                    self.canvas_area.set_background_image(image)
                     self.current_background_path = file_path
                     self.is_modified = True
                     self.current_selected_material = None
@@ -1091,7 +1130,7 @@ class MaterialEditor(QMainWindow):
                     self.control_panel.property_widget.set_background_image(image)
 
                     # 适应窗口大小
-                    self.canvas_area.canvas.zoom_to_fit()
+                    self.canvas_area.zoom_to_fit()
 
                     # 更新界面
                     self._update_window_title()
@@ -1107,6 +1146,10 @@ class MaterialEditor(QMainWindow):
                     QMessageBox.warning(self, "警告", f"无法加载图像文件: {file_path}")
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"加载背景图像失败: {str(e)}")
+                print(f"加载背景图像失败: {e}")
+                import traceback
+
+                traceback.print_exc()
 
     def _update_background_navigation_buttons(self):
         """更新背景图像导航按钮状态"""
@@ -1135,10 +1178,10 @@ class MaterialEditor(QMainWindow):
             self.layer_manager.clear_all_layers()
 
             # 清除画布选择
-            self.canvas_area.canvas.selected_instance = None
+            self.canvas_area.selected_instance = None
 
             # 更新画布显示
-            self.canvas_area.canvas.update_canvas()
+            self.canvas_area.update_canvas()
 
             # 刷新控制面板
             self.control_panel.refresh_layers()
@@ -1153,7 +1196,7 @@ class MaterialEditor(QMainWindow):
     def show_random_generate_dialog(self):
         """显示随机生成物体对话框"""
         # 检查是否有背景图像
-        if self.canvas_area.canvas.background_image is None:
+        if self.canvas_area.background_image is None:
             QMessageBox.warning(self, "警告", "请先加载背景图像")
             return
 
@@ -1164,12 +1207,12 @@ class MaterialEditor(QMainWindow):
             return
 
         # 获取画布尺寸
-        canvas_height, canvas_width = self.canvas_area.canvas.background_image.shape[:2]
+        canvas_height, canvas_width = self.canvas_area.background_image.shape[:2]
         canvas_size = (canvas_width, canvas_height)
 
         # 显示对话框
         dialog = RandomGenerateDialog(
-            material_names, canvas_size, self.canvas_area.canvas.background_image, self
+            material_names, canvas_size, self.canvas_area.background_image, self
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             params = dialog.get_generation_params()
@@ -1323,7 +1366,7 @@ class MaterialEditor(QMainWindow):
                     QApplication.processEvents()
 
             # 更新界面
-            self.canvas_area.canvas.update_canvas()
+            self.canvas_area.update_canvas()
             self.control_panel.refresh_layers()
 
             # 标记项目已修改
@@ -1349,7 +1392,6 @@ class MaterialEditor(QMainWindow):
             self.status_label.setText(error_msg)
             print(error_msg)
             import traceback
-
             traceback.print_exc()
 
     def _generate_positions(
@@ -1399,12 +1441,12 @@ class MaterialEditor(QMainWindow):
         self, x: int, y: int
     ) -> Tuple[int, int, int]:
         """在指定位置提取背景颜色"""
-        if self.canvas_area.canvas.background_image is None:
+        if self.canvas_area.background_image is None:
             return self._generate_random_color()
 
         try:
             # 获取背景图像
-            bg_image = self.canvas_area.canvas.background_image
+            bg_image = self.canvas_area.background_image
             h, w = bg_image.shape[:2]
 
             # 确保坐标在图像范围内
@@ -1511,7 +1553,7 @@ class MaterialEditor(QMainWindow):
 
     def _toggle_incremental_update(self, checked: bool):
         """切换增量更新"""
-        self.canvas_area.canvas.incremental_update_enabled = checked
+        self.canvas_area.incremental_update_enabled = checked
         status_text = "增量更新已启用" if checked else "增量更新已禁用"
         self.status_label.setText(status_text)
         print(f"性能设置: {status_text}")
