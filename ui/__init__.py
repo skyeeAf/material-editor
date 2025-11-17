@@ -1,1 +1,3 @@
-# UI module for material editor
+"""
+UI 子模块初始化文件
+"""
