@@ -41,7 +41,7 @@ from ui.dialogs import RandomGenerateDialog
 
 
 def cv_imread_rgba(path: str) -> np.ndarray:
-    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
     if img is None:
         raise RuntimeError(f"无法读取图像: {path}")
     if img.ndim == 2:
@@ -262,6 +262,12 @@ class MaterialItem(QGraphicsPixmapItem):
         self.tint_alpha = 0.0  # 0~1
         self.mask_offset = 0  # >0 膨胀, <0 腐蚀
         self.strong_tint = False  # 强叠加模式
+        self.feather_radius = 0  # 羽化半径 px (0~50)
+        self.brightness = 0  # 亮度偏移 (-100~100)
+        self.contrast = 100  # 对比度百分比 (50~200, 100=原始)
+        self.hue_shift = 0  # 色相偏移 (-180~180)
+        self.saturation = 100  # 饱和度百分比 (0~300, 100=原始)
+        self.gaussian_blur_radius = 0  # 高斯模糊半径 px (0~50)
         self.host = host
         self._update_pix()
 
@@ -283,12 +289,32 @@ class MaterialItem(QGraphicsPixmapItem):
             else:
                 alpha = cv2.erode(alpha, kernel, iterations=1)
             img[:, :, 3] = alpha
+        # 羽化（对 alpha 通道做高斯模糊）
+        if self.feather_radius > 0 and img.shape[2] >= 4:
+            ksize = self.feather_radius * 2 + 1
+            img[:, :, 3] = cv2.GaussianBlur(img[:, :, 3], (ksize, ksize), 0)
         # 颜色叠加（预览阶段也支持强叠加）
         eff_alpha = self.tint_alpha
         if self.strong_tint and eff_alpha > 0:
             eff_alpha = min(1.0, eff_alpha * 1.5)
         if eff_alpha > 0:
             img = tint_bgra(img, self.tint_color_bgr, eff_alpha)
+        # 亮度 / 对比度（仅处理 BGR 通道）
+        if self.brightness != 0 or self.contrast != 100:
+            bgr = img[:, :, :3]
+            bgr = cv2.convertScaleAbs(bgr, alpha=self.contrast / 100.0, beta=self.brightness)
+            img[:, :, :3] = bgr
+        # 色相偏移 / 饱和度（仅处理 BGR 通道）
+        if self.hue_shift != 0 or self.saturation != 100:
+            bgr = img[:, :, :3]
+            hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype(np.int16)
+            hsv[:, :, 0] = (hsv[:, :, 0] + self.hue_shift) % 180
+            hsv[:, :, 1] = np.clip(hsv[:, :, 1] * self.saturation / 100, 0, 255)
+            img[:, :, :3] = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+        # 高斯模糊（仅处理 BGR 通道）
+        if self.gaussian_blur_radius > 0:
+            ksize = self.gaussian_blur_radius * 2 + 1
+            img[:, :, :3] = cv2.GaussianBlur(img[:, :, :3], (ksize, ksize), 0)
         if self.scale_ratio != 1.0:
             img = cv2.resize(
                 img,
@@ -344,6 +370,36 @@ class MaterialItem(QGraphicsPixmapItem):
         self.strong_tint = bool(v)
         self._update_pix()
 
+    def set_feather_radius(self, v: int):
+        """设置羽化半径（像素）。"""
+        self.feather_radius = int(max(0, min(50, v)))
+        self._update_pix()
+
+    def set_brightness(self, v: int):
+        """设置亮度偏移。"""
+        self.brightness = int(max(-100, min(100, v)))
+        self._update_pix()
+
+    def set_contrast(self, v: int):
+        """设置对比度百分比。"""
+        self.contrast = int(max(50, min(200, v)))
+        self._update_pix()
+
+    def set_hue_shift(self, v: int):
+        """设置色相偏移。"""
+        self.hue_shift = int(max(-180, min(180, v)))
+        self._update_pix()
+
+    def set_saturation(self, v: int):
+        """设置饱和度百分比。"""
+        self.saturation = int(max(0, min(300, v)))
+        self._update_pix()
+
+    def set_gaussian_blur_radius(self, v: int):
+        """设置高斯模糊半径（像素）。"""
+        self.gaussian_blur_radius = int(max(0, min(50, v)))
+        self._update_pix()
+
     def to_composite_package(self) -> dict:
         disp = self._make_transformed_bgra_for_display()
         pos = self.scenePos()
@@ -376,6 +432,12 @@ class MaterialItem(QGraphicsPixmapItem):
             "z": float(self.zValue()),
             "mask_offset": int(self.mask_offset),
             "strong_tint": bool(self.strong_tint),
+            "feather_radius": int(self.feather_radius),
+            "brightness": int(self.brightness),
+            "contrast": int(self.contrast),
+            "hue_shift": int(self.hue_shift),
+            "saturation": int(self.saturation),
+            "gaussian_blur_radius": int(self.gaussian_blur_radius),
         }
 
     def itemChange(self, change, value):
@@ -595,6 +657,11 @@ class MainWindow(QMainWindow):
         self.sld_mask_offset.setRange(-20, 20)
         self.spn_mask_offset = QSpinBox()
         self.spn_mask_offset.setRange(-20, 20)
+        # 羽化
+        self.sld_feather = QSlider(Qt.Orientation.Horizontal)
+        self.sld_feather.setRange(0, 50)
+        self.spn_feather = QSpinBox()
+        self.spn_feather.setRange(0, 50)
 
         rot_row = QWidget()
         rl = QHBoxLayout(rot_row)
@@ -622,6 +689,11 @@ class MainWindow(QMainWindow):
         ml.setContentsMargins(0, 0, 0, 0)
         ml.addWidget(self.sld_mask_offset, 1)
         ml.addWidget(self.spn_mask_offset)
+        feather_row = QWidget()
+        fl = QHBoxLayout(feather_row)
+        fl.setContentsMargins(0, 0, 0, 0)
+        fl.addWidget(self.sld_feather, 1)
+        fl.addWidget(self.spn_feather)
 
         form.addRow("处理方式", self.cmb_mode)
         form.addRow("旋转(°)", rot_row)
@@ -629,6 +701,67 @@ class MainWindow(QMainWindow):
         form.addRow("颜色叠加", tint_row)
         form.addRow("颜色透明度(%)", alpha_row)
         form.addRow("掩码腐蚀/膨胀(px)", mask_row)
+        form.addRow("羽化(px)", feather_row)
+
+        # ---- 图像调整 GroupBox ----
+        grp_adjust = QGroupBox("图像调整")
+        adj_form = QFormLayout(grp_adjust)
+        # 亮度
+        self.sld_brightness = QSlider(Qt.Orientation.Horizontal)
+        self.sld_brightness.setRange(-100, 100)
+        self.spn_brightness = QSpinBox()
+        self.spn_brightness.setRange(-100, 100)
+        bright_row = QWidget()
+        brl2 = QHBoxLayout(bright_row)
+        brl2.setContentsMargins(0, 0, 0, 0)
+        brl2.addWidget(self.sld_brightness, 1)
+        brl2.addWidget(self.spn_brightness)
+        # 对比度
+        self.sld_contrast = QSlider(Qt.Orientation.Horizontal)
+        self.sld_contrast.setRange(50, 200)
+        self.spn_contrast = QSpinBox()
+        self.spn_contrast.setRange(50, 200)
+        contrast_row = QWidget()
+        crl = QHBoxLayout(contrast_row)
+        crl.setContentsMargins(0, 0, 0, 0)
+        crl.addWidget(self.sld_contrast, 1)
+        crl.addWidget(self.spn_contrast)
+        # 色相偏移
+        self.sld_hue = QSlider(Qt.Orientation.Horizontal)
+        self.sld_hue.setRange(-180, 180)
+        self.spn_hue = QSpinBox()
+        self.spn_hue.setRange(-180, 180)
+        hue_row = QWidget()
+        hrl = QHBoxLayout(hue_row)
+        hrl.setContentsMargins(0, 0, 0, 0)
+        hrl.addWidget(self.sld_hue, 1)
+        hrl.addWidget(self.spn_hue)
+        # 饱和度
+        self.sld_sat = QSlider(Qt.Orientation.Horizontal)
+        self.sld_sat.setRange(0, 300)
+        self.spn_sat = QSpinBox()
+        self.spn_sat.setRange(0, 300)
+        sat_row = QWidget()
+        srl = QHBoxLayout(sat_row)
+        srl.setContentsMargins(0, 0, 0, 0)
+        srl.addWidget(self.sld_sat, 1)
+        srl.addWidget(self.spn_sat)
+        # 高斯模糊
+        self.sld_gaussian = QSlider(Qt.Orientation.Horizontal)
+        self.sld_gaussian.setRange(0, 50)
+        self.spn_gaussian = QSpinBox()
+        self.spn_gaussian.setRange(0, 50)
+        gauss_row = QWidget()
+        grl = QHBoxLayout(gauss_row)
+        grl.setContentsMargins(0, 0, 0, 0)
+        grl.addWidget(self.sld_gaussian, 1)
+        grl.addWidget(self.spn_gaussian)
+
+        adj_form.addRow("亮度", bright_row)
+        adj_form.addRow("对比度(%)", contrast_row)
+        adj_form.addRow("色相偏移", hue_row)
+        adj_form.addRow("饱和度(%)", sat_row)
+        adj_form.addRow("高斯模糊(px)", gauss_row)
 
         grp_bg = QGroupBox("背景与颜色")
         bg_l = QVBoxLayout(grp_bg)
@@ -651,6 +784,7 @@ class MainWindow(QMainWindow):
 
         vl.addWidget(grp_top)
         vl.addWidget(props)
+        vl.addWidget(grp_adjust)
         vl.addWidget(grp_bg)
         vl.addWidget(grp_bottom, 1)
         return w
@@ -685,6 +819,18 @@ class MainWindow(QMainWindow):
         self.spn_tint_alpha.valueChanged.connect(self.sld_tint_alpha.setValue)
         self.sld_mask_offset.valueChanged.connect(self.spn_mask_offset.setValue)
         self.spn_mask_offset.valueChanged.connect(self.sld_mask_offset.setValue)
+        self.sld_feather.valueChanged.connect(self.spn_feather.setValue)
+        self.spn_feather.valueChanged.connect(self.sld_feather.setValue)
+        self.sld_brightness.valueChanged.connect(self.spn_brightness.setValue)
+        self.spn_brightness.valueChanged.connect(self.sld_brightness.setValue)
+        self.sld_contrast.valueChanged.connect(self.spn_contrast.setValue)
+        self.spn_contrast.valueChanged.connect(self.sld_contrast.setValue)
+        self.sld_hue.valueChanged.connect(self.spn_hue.setValue)
+        self.spn_hue.valueChanged.connect(self.sld_hue.setValue)
+        self.sld_sat.valueChanged.connect(self.spn_sat.setValue)
+        self.spn_sat.valueChanged.connect(self.sld_sat.setValue)
+        self.sld_gaussian.valueChanged.connect(self.spn_gaussian.setValue)
+        self.spn_gaussian.valueChanged.connect(self.sld_gaussian.setValue)
 
         self.sld_rot.valueChanged.connect(self._apply_props_to_item)
         self.sld_scale.valueChanged.connect(self._apply_props_to_item)
@@ -694,6 +840,12 @@ class MainWindow(QMainWindow):
         self.sld_tint_alpha.valueChanged.connect(self._apply_props_to_item)
         self.btn_tint_color.clicked.connect(self._choose_tint_color)
         self.sld_mask_offset.valueChanged.connect(self._apply_props_to_item)
+        self.sld_feather.valueChanged.connect(self._apply_props_to_item)
+        self.sld_brightness.valueChanged.connect(self._apply_props_to_item)
+        self.sld_contrast.valueChanged.connect(self._apply_props_to_item)
+        self.sld_hue.valueChanged.connect(self._apply_props_to_item)
+        self.sld_sat.valueChanged.connect(self._apply_props_to_item)
+        self.sld_gaussian.valueChanged.connect(self._apply_props_to_item)
 
         self.btn_pick_bg_color.clicked.connect(self._toggle_pick_bg_color)
         self.btn_extract_bg_color.clicked.connect(self._extract_bg_main_color)
@@ -788,7 +940,9 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "错误", str(e))
             return
         if mask_path:
-            mask_img = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+            mask_img = cv2.imdecode(
+                np.fromfile(mask_path, dtype=np.uint8), cv2.IMREAD_UNCHANGED
+            )
             if mask_img is None:
                 QMessageBox.warning(
                     self, "警告", f"无法读取掩码: {mask_path}，将忽略该掩码。"
@@ -827,7 +981,7 @@ class MainWindow(QMainWindow):
             return
         self.current_bg_index = idx
         path = self.bg_list[idx]
-        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
         if img is None:
             QMessageBox.warning(self, "警告", f"无法读取背景: {path}")
             return
@@ -984,7 +1138,9 @@ class MainWindow(QMainWindow):
                 print(f"加载素材失败 {img_path}: {e}")
                 continue
             if mask_path:
-                mask_img = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+                mask_img = cv2.imdecode(
+                    np.fromfile(mask_path, dtype=np.uint8), cv2.IMREAD_UNCHANGED
+                )
                 if mask_img is not None:
                     src = apply_mask_to_bgra(src, mask_img)
             src = crop_to_alpha_bbox(src)
@@ -1261,6 +1417,12 @@ class MainWindow(QMainWindow):
                 self.chk_tint_strong.setChecked(False)
                 self.sld_tint_alpha.setValue(0)
                 self.sld_mask_offset.setValue(0)
+                self.sld_feather.setValue(0)
+                self.sld_brightness.setValue(0)
+                self.sld_contrast.setValue(100)
+                self.sld_hue.setValue(0)
+                self.sld_sat.setValue(100)
+                self.sld_gaussian.setValue(0)
                 self._set_tint_button_color(None)
                 return
             self.cmb_mode.setCurrentIndex(m.blend_mode)
@@ -1270,6 +1432,12 @@ class MainWindow(QMainWindow):
             self.sld_tint_alpha.setValue(int(round(m.tint_alpha * 100)))
             self.sld_mask_offset.setValue(int(m.mask_offset))
             self.chk_tint_strong.setChecked(bool(getattr(m, "strong_tint", False)))
+            self.sld_feather.setValue(int(m.feather_radius))
+            self.sld_brightness.setValue(int(m.brightness))
+            self.sld_contrast.setValue(int(m.contrast))
+            self.sld_hue.setValue(int(m.hue_shift))
+            self.sld_sat.setValue(int(m.saturation))
+            self.sld_gaussian.setValue(int(m.gaussian_blur_radius))
             self._set_tint_button_color(m.tint_color_bgr if m.tint_alpha > 0 else None)
         finally:
             self._suppress_ui = False
@@ -1291,6 +1459,12 @@ class MainWindow(QMainWindow):
         self._set_tint_button_color(m.tint_color_bgr if alpha > 0 else None)
         m.set_mask_offset(self.sld_mask_offset.value())
         m.set_strong_tint(self.chk_tint_strong.isChecked())
+        m.set_feather_radius(self.sld_feather.value())
+        m.set_brightness(self.sld_brightness.value())
+        m.set_contrast(self.sld_contrast.value())
+        m.set_hue_shift(self.sld_hue.value())
+        m.set_saturation(self.sld_sat.value())
+        m.set_gaussian_blur_radius(self.sld_gaussian.value())
 
         # 若选择了泊松模式且尚未开启高质量预览，自动打开以便看到效果
         if m.blend_mode != BlendMode.PASTE and not self.hq_enabled:
@@ -1623,6 +1797,12 @@ class MainWindow(QMainWindow):
             m.set_blend_mode(int(sd.get("mode", BlendMode.PASTE)))
             m.set_mask_offset(int(sd.get("mask_offset", 0)))
             m.set_strong_tint(bool(sd.get("strong_tint", False)))
+            m.set_feather_radius(int(sd.get("feather_radius", 0)))
+            m.set_brightness(int(sd.get("brightness", 0)))
+            m.set_contrast(int(sd.get("contrast", 100)))
+            m.set_hue_shift(int(sd.get("hue_shift", 0)))
+            m.set_saturation(int(sd.get("saturation", 100)))
+            m.set_gaussian_blur_radius(int(sd.get("gaussian_blur_radius", 0)))
             self.material_items.append(m)
         self._rebuild_right_list()
         self._disable_hq_overlay()
