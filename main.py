@@ -49,7 +49,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from harmonize import harmonize_region, repair_seam
+from harmonize import (
+    get_available_harmonize_backends,
+    harmonize_region,
+    repair_seam,
+    set_harmonize_backend,
+)
 from patchmatch_inpaint import (
     InpaintBackend,
     _get_backend_name,
@@ -206,6 +211,8 @@ class BlendMode:
     PASTE = 0
     POISSON_NORMAL = 1
     POISSON_MIXED = 2
+    KONTEXT_BLEND = 3
+    KONTEXT_HARMONIZE = 4
 
 
 class _HqSignals(QObject):
@@ -827,7 +834,17 @@ class MainWindow(QMainWindow):
         props = QGroupBox("属性")
         form = QFormLayout(props)
         self.cmb_mode = QComboBox()
-        self.cmb_mode.addItems(["直接粘贴", "泊松融合 Normal", "泊松融合 Mix"])
+        self.cmb_mode.addItems(
+            [
+                "直接粘贴",
+                "泊松融合 Normal",
+                "泊松融合 Mix",
+                "AI 融合 (Kontext)",
+                "AI 融合+协调 (Kontext)",
+            ]
+        )
+        # 检测 Kontext 是否可用，不可用时灰显对应选项
+
         self.sld_rot = QSlider(Qt.Orientation.Horizontal)
         self.sld_rot.setRange(0, 359)
         self.spn_rot = QSpinBox()
@@ -895,17 +912,43 @@ class MainWindow(QMainWindow):
         form.addRow("掩码腐蚀/膨胀(px)", mask_row)
         form.addRow("羽化(px)", feather_row)
 
-        # 后处理复选框
+        # 后处理复选框 + 算法选择
+        self.chk_harmonize = QCheckBox("色调协调")
+        self.chk_harmonize.setToolTip("自动调整素材色调匹配背景")
+        self.cmb_harmonize_backend = QComboBox()
+        self.cmb_harmonize_backend.setToolTip("色调协调算法")
+        self._harmonize_backend_list = get_available_harmonize_backends()
+        for backend, display, available in self._harmonize_backend_list:
+            self.cmb_harmonize_backend.addItem(display)
+            if not available:
+                idx = self.cmb_harmonize_backend.count() - 1
+                item = self.cmb_harmonize_backend.model().item(idx)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
+        harm_row = QWidget()
+        harm_l = QHBoxLayout(harm_row)
+        harm_l.setContentsMargins(0, 0, 0, 0)
+        harm_l.addWidget(self.chk_harmonize)
+        harm_l.addWidget(self.cmb_harmonize_backend, 1)
+
         self.chk_seam_repair = QCheckBox("接缝修复")
         self.chk_seam_repair.setToolTip("粘贴后用 inpaint 修复素材边缘接缝")
-        self.chk_harmonize = QCheckBox("色调协调")
-        self.chk_harmonize.setToolTip("自动调整素材色调匹配背景（Reinhard / libcom）")
-        postproc_row = QWidget()
-        pp_l = QHBoxLayout(postproc_row)
-        pp_l.setContentsMargins(0, 0, 0, 0)
-        pp_l.addWidget(self.chk_seam_repair)
-        pp_l.addWidget(self.chk_harmonize)
-        form.addRow("后处理", postproc_row)
+        self.cmb_inpaint_backend = QComboBox()
+        self.cmb_inpaint_backend.setToolTip("接缝修复算法")
+        self._inpaint_backend_list = get_available_backends()
+        for backend, display, available in self._inpaint_backend_list:
+            self.cmb_inpaint_backend.addItem(display)
+            if not available:
+                idx = self.cmb_inpaint_backend.count() - 1
+                item = self.cmb_inpaint_backend.model().item(idx)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
+        seam_row = QWidget()
+        seam_l = QHBoxLayout(seam_row)
+        seam_l.setContentsMargins(0, 0, 0, 0)
+        seam_l.addWidget(self.chk_seam_repair)
+        seam_l.addWidget(self.cmb_inpaint_backend, 1)
+
+        form.addRow("色调协调", harm_row)
+        form.addRow("接缝修复", seam_row)
 
         # ---- 图像调整 GroupBox ----
         grp_adjust = QGroupBox("图像调整")
@@ -1052,6 +1095,12 @@ class MainWindow(QMainWindow):
         self.sld_gaussian.valueChanged.connect(self._apply_props_to_item)
         self.chk_seam_repair.toggled.connect(self._apply_props_to_item)
         self.chk_harmonize.toggled.connect(self._apply_props_to_item)
+        self.cmb_harmonize_backend.currentIndexChanged.connect(
+            self._on_harmonize_backend_changed,
+        )
+        self.cmb_inpaint_backend.currentIndexChanged.connect(
+            self._on_inpaint_backend_changed,
+        )
 
         self.btn_pick_bg_color.clicked.connect(self._toggle_pick_bg_color)
         self.btn_extract_bg_color.clicked.connect(self._extract_bg_main_color)
@@ -1234,6 +1283,8 @@ class MainWindow(QMainWindow):
                 BlendMode.PASTE,
                 BlendMode.POISSON_NORMAL,
                 BlendMode.POISSON_MIXED,
+                BlendMode.KONTEXT_BLEND,
+                BlendMode.KONTEXT_HARMONIZE,
             }
         )
         ok = cv2.imwrite(path, canvas)
@@ -1312,6 +1363,10 @@ class MainWindow(QMainWindow):
                 return BlendMode.POISSON_NORMAL
             if m == "poisson_mixed":
                 return BlendMode.POISSON_MIXED
+            if m == "kontext_blend" and self._kontext_available:
+                return BlendMode.KONTEXT_BLEND
+            if m == "kontext_harm" and self._kontext_available:
+                return BlendMode.KONTEXT_HARMONIZE
             return BlendMode.PASTE
 
         def choose_color(x: int, y: int) -> Tuple[Tuple[int, int, int], float, bool]:
@@ -1737,6 +1792,40 @@ class MainWindow(QMainWindow):
         self._schedule_hq_preview()
         self._schedule_history_snapshot()
 
+    def _on_harmonize_backend_changed(self, index: int) -> None:
+        """用户切换色调协调算法时更新全局后端设置。"""
+        if index < 0 or index >= len(self._harmonize_backend_list):
+            return
+        backend, display, available = self._harmonize_backend_list[index]
+        if not available:
+            return
+        try:
+            set_harmonize_backend(backend)
+        except ValueError as e:
+            print(f"[MainWindow] 切换色调协调后端失败: {e}")
+            return
+        print(f"[MainWindow] 色调协调后端 → {display}")
+        # 后端变更后刷新 HQ 预览
+        self._disable_hq_overlay()
+        self._schedule_hq_preview()
+
+    def _on_inpaint_backend_changed(self, index: int) -> None:
+        """用户切换接缝修复算法时更新全局后端设置。"""
+        if index < 0 or index >= len(self._inpaint_backend_list):
+            return
+        backend, display, available = self._inpaint_backend_list[index]
+        if not available:
+            return
+        try:
+            set_backend(backend)
+        except ValueError as e:
+            print(f"[MainWindow] 切换接缝修复后端失败: {e}")
+            return
+        print(f"[MainWindow] 接缝修复后端 → {display}")
+        # 后端变更后刷新 HQ 预览
+        self._disable_hq_overlay()
+        self._schedule_hq_preview()
+
     def _delete_selected_added(self):
         row = self.list_added.currentRow()
         if row < 0 or row >= len(self.material_items):
@@ -1858,15 +1947,12 @@ class MainWindow(QMainWindow):
         # 如果上一轮 HQ 任务还在运行，跳过（避免重复提交重量级后处理）
         if self._hq_future is not None and not self._hq_future.done():
             return
-        items_state = [
-            m.to_composite_package()
-            for m in self.material_items
-            if self._needs_hq_preview(m)
-        ]
-        # 没有需要 HQ 预览的素材时，隐藏 overlay 并跳过
-        if not items_state:
+        # 只要有任一素材需要 HQ 预览，就把全部素材纳入渲染
+        has_hq = any(self._needs_hq_preview(m) for m in self.material_items)
+        if not has_hq:
             self._disable_hq_overlay()
             return
+        items_state = [m.to_composite_package() for m in self.material_items]
         serial = self.hq_serial = self.hq_serial + 1
         bgr = self.bg_bgr.copy()
 
