@@ -7,7 +7,16 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 from PySide6.QtCore import QObject, QPointF, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QIcon, QImage, QPainter, QPixmap
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QIcon,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -16,9 +25,11 @@ from PySide6.QtWidgets import (
     QColorDialog,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QGraphicsItem,
+    QGraphicsPathItem,
     QGraphicsPixmapItem,
     QGraphicsScene,
     QGraphicsView,
@@ -36,6 +47,16 @@ from PySide6.QtWidgets import (
     QToolBar,
     QVBoxLayout,
     QWidget,
+)
+
+from harmonize import harmonize_region, repair_seam
+from patchmatch_inpaint import (
+    InpaintBackend,
+    _get_backend_name,
+    get_available_backends,
+    get_backend,
+    patchmatch_inpaint,
+    set_backend,
 )
 from ui.dialogs import RandomGenerateDialog
 
@@ -191,11 +212,21 @@ class _HqSignals(QObject):
     finished = Signal(int, object)  # (serial, canvas_bgr)
 
 
+class _InpaintSignals(QObject):
+    """内容识别填充异步结果信号。"""
+
+    finished = Signal(object)  # result_bgr: np.ndarray
+    error = Signal(str)  # 错误信息
+
+
 class GLGraphicsView(QGraphicsView):
+    """自定义 QGraphicsView，支持缩放、背景取色和套索选区。"""
+
     zoomChanged = Signal(float)
     requestPickBackgroundColor = Signal(int, int)
     mousePressed = Signal()
     mouseReleased = Signal()
+    lassoCompleted = Signal(list)
 
     def __init__(self, scene: QGraphicsScene, parent=None):
         super().__init__(scene, parent)
@@ -213,6 +244,11 @@ class GLGraphicsView(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self._zoom = 1.0
         self._picking_bg_color = False
+        # 套索模式
+        self._lasso_mode = False
+        self._lasso_drawing = False
+        self._lasso_points: List[QPointF] = []
+        self._lasso_path_item: Optional[QGraphicsPathItem] = None
 
     def wheelEvent(self, event):
         angle = event.angleDelta().y()
@@ -231,15 +267,83 @@ class GLGraphicsView(QGraphicsView):
             Qt.CursorShape.CrossCursor if enable else Qt.CursorShape.ArrowCursor
         )
 
+    def enable_lasso_mode(self, enable: bool):
+        """进入或退出套索选区模式。"""
+        self._lasso_mode = enable
+        self._lasso_drawing = False
+        if enable:
+            self.setDragMode(QGraphicsView.DragMode.NoDrag)
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.clear_lasso_path()
+
+    def clear_lasso_path(self):
+        """清除套索路径可视化。"""
+        if self._lasso_path_item is not None:
+            self.scene().removeItem(self._lasso_path_item)
+            self._lasso_path_item = None
+        self._lasso_points.clear()
+        self._lasso_drawing = False
+
+    def _update_lasso_visual(self):
+        """根据 _lasso_points 更新套索路径可视化。"""
+        if not self._lasso_points:
+            return
+        path = QPainterPath()
+        path.moveTo(self._lasso_points[0])
+        for pt in self._lasso_points[1:]:
+            path.lineTo(pt)
+        if self._lasso_path_item is None:
+            pen = QPen(QColor(0, 255, 255, 200), 2, Qt.PenStyle.DashLine)
+            pen.setCosmetic(True)
+            self._lasso_path_item = QGraphicsPathItem(path)
+            self._lasso_path_item.setPen(pen)
+            self._lasso_path_item.setBrush(QColor(0, 255, 255, 30))
+            self._lasso_path_item.setZValue(10000)
+            self.scene().addItem(self._lasso_path_item)
+        else:
+            self._lasso_path_item.setPath(path)
+
     def mousePressEvent(self, event):
         if self._picking_bg_color and event.button() == Qt.MouseButton.LeftButton:
             scene_pos = self.mapToScene(event.position().toPoint())
             self.requestPickBackgroundColor.emit(int(scene_pos.x()), int(scene_pos.y()))
             return
+        if self._lasso_mode and event.button() == Qt.MouseButton.LeftButton:
+            self.clear_lasso_path()
+            self._lasso_drawing = True
+            scene_pos = self.mapToScene(event.position().toPoint())
+            self._lasso_points.append(scene_pos)
+            return
         self.mousePressed.emit()
         super().mousePressEvent(event)
 
+    def mouseMoveEvent(self, event):
+        if self._lasso_mode and self._lasso_drawing:
+            scene_pos = self.mapToScene(event.position().toPoint())
+            self._lasso_points.append(scene_pos)
+            self._update_lasso_visual()
+            return
+        super().mouseMoveEvent(event)
+
     def mouseReleaseEvent(self, event):
+        if (
+            self._lasso_mode
+            and self._lasso_drawing
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            self._lasso_drawing = False
+            if len(self._lasso_points) < 10:
+                self.clear_lasso_path()
+                return
+            # 闭合路径并更新可视化
+            self._lasso_points.append(self._lasso_points[0])
+            self._update_lasso_visual()
+            # 发射完成信号（传递副本）
+            self.lassoCompleted.emit(list(self._lasso_points))
+            return
         super().mouseReleaseEvent(event)
         self.mouseReleased.emit()
 
@@ -268,6 +372,8 @@ class MaterialItem(QGraphicsPixmapItem):
         self.hue_shift = 0  # 色相偏移 (-180~180)
         self.saturation = 100  # 饱和度百分比 (0~300, 100=原始)
         self.gaussian_blur_radius = 0  # 高斯模糊半径 px (0~50)
+        self.seam_repair = False  # 接缝修复（LaMa/inpaint）
+        self.harmonize = False  # 色调协调
         self.host = host
         self._update_pix()
 
@@ -401,6 +507,7 @@ class MaterialItem(QGraphicsPixmapItem):
         self._update_pix()
 
     def to_composite_package(self) -> dict:
+        """导出合成所需的完整数据包。"""
         disp = self._make_transformed_bgra_for_display()
         pos = self.scenePos()
         cx = int(pos.x() + self.boundingRect().width() / 2)
@@ -417,9 +524,12 @@ class MaterialItem(QGraphicsPixmapItem):
             "tint_color_bgr": tuple(self.tint_color_bgr),
             "tint_alpha": float(self.tint_alpha),
             "strong_tint": bool(self.strong_tint),
+            "seam_repair": bool(self.seam_repair),
+            "harmonize": bool(self.harmonize),
         }
 
     def to_state_dict(self) -> Dict[str, Any]:
+        """序列化为状态字典（用于保存/撤销）。"""
         return {
             "name": self.name,
             "path": self.path,
@@ -438,6 +548,8 @@ class MaterialItem(QGraphicsPixmapItem):
             "hue_shift": int(self.hue_shift),
             "saturation": int(self.saturation),
             "gaussian_blur_radius": int(self.gaussian_blur_radius),
+            "seam_repair": bool(self.seam_repair),
+            "harmonize": bool(self.harmonize),
         }
 
     def itemChange(self, change, value):
@@ -466,6 +578,72 @@ class MaterialItem(QGraphicsPixmapItem):
             self.host._on_item_interaction_finished(self)
 
 
+class ContentAwareFillDialog(QDialog):
+    """内容识别填充参数对话框。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("内容识别填充 (PatchMatch)")
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        # 后端选择
+        self.cmb_backend = QComboBox()
+        backends = get_available_backends()
+        current = get_backend()
+        select_idx = 0
+        for i, (backend_enum, display_name, available) in enumerate(backends):
+            suffix = "" if available else " [不可用]"
+            self.cmb_backend.addItem(display_name + suffix, userData=backend_enum)
+            if not available:
+                # 禁用不可用项
+                self.cmb_backend.model().item(i).setEnabled(False)
+            if backend_enum == current:
+                select_idx = i
+        self.cmb_backend.setCurrentIndex(select_idx)
+        form.addRow("后端", self.cmb_backend)
+
+        self.spn_patch = QSpinBox()
+        self.spn_patch.setRange(3, 15)
+        self.spn_patch.setValue(7)
+        self.spn_patch.setSingleStep(2)
+        form.addRow("patch 大小(px)", self.spn_patch)
+
+        self.spn_expand = QSpinBox()
+        self.spn_expand.setRange(0, 20)
+        self.spn_expand.setValue(3)
+        form.addRow("选区扩展(px)", self.spn_expand)
+
+        self.spn_max_size = QSpinBox()
+        self.spn_max_size.setRange(0, 4096)
+        self.spn_max_size.setValue(0)
+        self.spn_max_size.setSingleStep(128)
+        self.spn_max_size.setSpecialValueText("不限制")
+        self.spn_max_size.setToolTip(
+            "ROI 长边上限（像素），0=不限制。降采样可大幅加速，但会损失细节。"
+        )
+        form.addRow("降采样上限(px)", self.spn_max_size)
+
+        layout.addLayout(form)
+        btn_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+
+    def get_params(self) -> Optional[Dict[str, Any]]:
+        """显示对话框并返回参数字典，取消返回 None。"""
+        if self.exec() == QDialog.DialogCode.Accepted:
+            return {
+                "patch_size": self.spn_patch.value(),
+                "expand": self.spn_expand.value(),
+                "backend": self.cmb_backend.currentData(),
+                "max_size": self.spn_max_size.value(),
+            }
+        return None
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -476,16 +654,20 @@ class MainWindow(QMainWindow):
         self.view = GLGraphicsView(self.scene, self)
         self.view.setBackgroundBrush(QColor(30, 30, 30))
         self.view.requestPickBackgroundColor.connect(self._on_pick_bg_color)
-        self.view.mousePressed.connect(lambda: self._disable_hq_overlay())
-        self.view.mouseReleased.connect(lambda: self._schedule_hq_preview())
+        # 注：不在 view 级 mousePressed/mouseReleased 上触发 HQ 重渲染，
+        # 因为平移/缩放不改变合成结果。素材拖动已通过
+        # MaterialItem.itemChange → _on_item_interaction_finished 正确处理。
 
         self.bg_pix_item = QGraphicsPixmapItem()
         self.bg_pix_item.setZValue(-1000)
         self.scene.addItem(self.bg_pix_item)
 
         self.hq_overlay_item = QGraphicsPixmapItem()
-        self.hq_overlay_item.setZValue(-500)
+        self.hq_overlay_item.setZValue(9000)  # 在素材之上，视觉覆盖
         self.hq_overlay_item.setVisible(False)
+        # 禁止 overlay 接收鼠标事件，点击穿透到下方的素材
+        self.hq_overlay_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.hq_overlay_item.setAcceptHoverEvents(False)
         self.scene.addItem(self.hq_overlay_item)
 
         self.current_bg_index = -1
@@ -538,6 +720,12 @@ class MainWindow(QMainWindow):
         self._hq_signals = _HqSignals(self)
         self._hq_signals.finished.connect(self._apply_hq_result)
 
+        # content-aware fill async controls
+        self._inpaint_signals = _InpaintSignals(self)
+        self._inpaint_signals.finished.connect(self._on_inpaint_finished)
+        self._inpaint_signals.error.connect(self._on_inpaint_error)
+        self._inpaint_future = None
+
         # history (undo/redo)
         self.history: List[Dict[str, Any]] = []
         self.history_index: int = -1
@@ -563,6 +751,8 @@ class MainWindow(QMainWindow):
         self.act_hq_preview = QAction("高质量预览", self)
         self.act_hq_preview.setCheckable(True)
         self.act_random_generate = QAction("随机生成素材", self)
+        self.act_lasso_fill = QAction("套索填充", self)
+        self.act_lasso_fill.setCheckable(True)
         self.act_undo = QAction("撤销", self)
         self.act_undo.setShortcut("Ctrl+Z")
         self.act_redo = QAction("重做", self)
@@ -581,6 +771,8 @@ class MainWindow(QMainWindow):
         tb.addAction(self.act_random_generate)
         tb.addSeparator()
         tb.addAction(self.act_hq_preview)
+        tb.addSeparator()
+        tb.addAction(self.act_lasso_fill)
         tb.addSeparator()
         tb.addAction(self.act_undo)
         tb.addAction(self.act_redo)
@@ -702,6 +894,18 @@ class MainWindow(QMainWindow):
         form.addRow("颜色透明度(%)", alpha_row)
         form.addRow("掩码腐蚀/膨胀(px)", mask_row)
         form.addRow("羽化(px)", feather_row)
+
+        # 后处理复选框
+        self.chk_seam_repair = QCheckBox("接缝修复")
+        self.chk_seam_repair.setToolTip("粘贴后用 inpaint 修复素材边缘接缝")
+        self.chk_harmonize = QCheckBox("色调协调")
+        self.chk_harmonize.setToolTip("自动调整素材色调匹配背景（Reinhard / libcom）")
+        postproc_row = QWidget()
+        pp_l = QHBoxLayout(postproc_row)
+        pp_l.setContentsMargins(0, 0, 0, 0)
+        pp_l.addWidget(self.chk_seam_repair)
+        pp_l.addWidget(self.chk_harmonize)
+        form.addRow("后处理", postproc_row)
 
         # ---- 图像调整 GroupBox ----
         grp_adjust = QGroupBox("图像调整")
@@ -846,13 +1050,22 @@ class MainWindow(QMainWindow):
         self.sld_hue.valueChanged.connect(self._apply_props_to_item)
         self.sld_sat.valueChanged.connect(self._apply_props_to_item)
         self.sld_gaussian.valueChanged.connect(self._apply_props_to_item)
+        self.chk_seam_repair.toggled.connect(self._apply_props_to_item)
+        self.chk_harmonize.toggled.connect(self._apply_props_to_item)
 
         self.btn_pick_bg_color.clicked.connect(self._toggle_pick_bg_color)
         self.btn_extract_bg_color.clicked.connect(self._extract_bg_main_color)
 
         self.scene.selectionChanged.connect(self._on_scene_selection_changed)
 
+        self.act_lasso_fill.toggled.connect(self._on_toggle_lasso_mode)
+        self.view.lassoCompleted.connect(self._on_lasso_completed)
+
     def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            if self.act_lasso_fill.isChecked():
+                self.act_lasso_fill.setChecked(False)
+                return
         if event.key() == Qt.Key.Key_Delete:
             self._delete_selected_added()
             return
@@ -1208,9 +1421,43 @@ class MainWindow(QMainWindow):
         self._schedule_hq_preview()
         self._push_history()
 
+    @staticmethod
+    def _project_fg_mask(
+        canvas_h: int,
+        canvas_w: int,
+        src_bgra: np.ndarray,
+        cx: int,
+        cy: int,
+    ) -> np.ndarray:
+        """将素材 alpha 通道投射为 canvas 坐标系上的前景 mask。
+
+        Args:
+            canvas_h (int): 画布高度.
+            canvas_w (int): 画布宽度.
+            src_bgra (np.ndarray): 素材 BGRA.
+            cx (int): 素材中心 x.
+            cy (int): 素材中心 y.
+
+        Returns:
+            np.ndarray: canvas 尺寸的 uint8 mask (255=前景).
+        """
+        sh, sw = src_bgra.shape[:2]
+        x0, y0 = cx - sw // 2, cy - sh // 2
+        ix0, iy0 = max(0, x0), max(0, y0)
+        ix1, iy1 = min(canvas_w, x0 + sw), min(canvas_h, y0 + sh)
+        fg_mask = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+        if ix0 >= ix1 or iy0 >= iy1:
+            return fg_mask
+        sx0, sy0 = ix0 - x0, iy0 - y0
+        sx1, sy1 = sx0 + (ix1 - ix0), sy0 + (iy1 - iy0)
+        alpha_roi = src_bgra[sy0:sy1, sx0:sx1, 3]
+        fg_mask[iy0:iy1, ix0:ix1] = (alpha_roi > 0).astype(np.uint8) * 255
+        return fg_mask
+
     def _render_composite_high_quality(
         self, include_modes: Optional[set] = None
     ) -> np.ndarray:
+        """渲染高质量合成结果（含后处理）。"""
         bg = (
             self.bg_bgr
             if self.bg_bgr is not None
@@ -1229,6 +1476,8 @@ class MainWindow(QMainWindow):
             mode = pkg["mode"]
             tint_color_bgr = tuple(pkg.get("tint_color_bgr", (0, 0, 0)))
             tint_alpha = float(pkg.get("tint_alpha", 0.0))
+            do_harmonize = bool(pkg.get("harmonize", False))
+            do_seam_repair = bool(pkg.get("seam_repair", False))
             cx = int(max(0, min(w - 1, cx)))
             cy = int(max(0, min(h - 1, cy)))
             if mode == BlendMode.PASTE:
@@ -1305,6 +1554,15 @@ class MainWindow(QMainWindow):
                         tint_color_bgr,
                         tint_alpha,
                     )
+
+            # ---- 后处理：色调协调 + 接缝修复 ----
+            if do_harmonize or do_seam_repair:
+                fg_mask = self._project_fg_mask(h, w, src_bgra, cx, cy)
+                if np.any(fg_mask > 0):
+                    if do_harmonize:
+                        canvas = harmonize_region(canvas, fg_mask)
+                    if do_seam_repair:
+                        canvas = repair_seam(canvas, fg_mask)
         return canvas
 
     @staticmethod
@@ -1438,6 +1696,8 @@ class MainWindow(QMainWindow):
             self.sld_hue.setValue(int(m.hue_shift))
             self.sld_sat.setValue(int(m.saturation))
             self.sld_gaussian.setValue(int(m.gaussian_blur_radius))
+            self.chk_seam_repair.setChecked(m.seam_repair)
+            self.chk_harmonize.setChecked(m.harmonize)
             self._set_tint_button_color(m.tint_color_bgr if m.tint_alpha > 0 else None)
         finally:
             self._suppress_ui = False
@@ -1465,9 +1725,12 @@ class MainWindow(QMainWindow):
         m.set_hue_shift(self.sld_hue.value())
         m.set_saturation(self.sld_sat.value())
         m.set_gaussian_blur_radius(self.sld_gaussian.value())
+        m.seam_repair = self.chk_seam_repair.isChecked()
+        m.harmonize = self.chk_harmonize.isChecked()
 
-        # 若选择了泊松模式且尚未开启高质量预览，自动打开以便看到效果
-        if m.blend_mode != BlendMode.PASTE and not self.hq_enabled:
+        # 若选择了需要 HQ 预览的模式，自动打开
+        needs_hq = m.blend_mode != BlendMode.PASTE or m.seam_repair or m.harmonize
+        if needs_hq and not self.hq_enabled:
             self.act_hq_preview.setChecked(True)
 
         self._disable_hq_overlay()
@@ -1575,13 +1838,14 @@ class MainWindow(QMainWindow):
         else:
             self._schedule_hq_preview()
 
+    @staticmethod
+    def _needs_hq_preview(m: "MaterialItem") -> bool:
+        """判断素材是否需要走 HQ 预览管线。"""
+        return m.blend_mode != BlendMode.PASTE or m.seam_repair or m.harmonize
+
     def _disable_hq_overlay(self):
         self.hq_timer.stop()
         self.hq_overlay_item.setVisible(False)
-        # 恢复所有泊松项可见
-        for m in self.material_items:
-            if m.blend_mode != BlendMode.PASTE:
-                m.setVisible(True)
 
     def _schedule_hq_preview(self):
         if not self.hq_enabled or self.bg_bgr is None:
@@ -1591,13 +1855,20 @@ class MainWindow(QMainWindow):
     def _run_hq_preview_async(self):
         if not self.hq_enabled or self.bg_bgr is None:
             return
-        serial = self.hq_serial = self.hq_serial + 1
-        bgr = self.bg_bgr.copy()
+        # 如果上一轮 HQ 任务还在运行，跳过（避免重复提交重量级后处理）
+        if self._hq_future is not None and not self._hq_future.done():
+            return
         items_state = [
             m.to_composite_package()
             for m in self.material_items
-            if m.blend_mode != BlendMode.PASTE
+            if self._needs_hq_preview(m)
         ]
+        # 没有需要 HQ 预览的素材时，隐藏 overlay 并跳过
+        if not items_state:
+            self._disable_hq_overlay()
+            return
+        serial = self.hq_serial = self.hq_serial + 1
+        bgr = self.bg_bgr.copy()
 
         def task(bg_img: np.ndarray, pkgs: List[dict]) -> Tuple[int, np.ndarray]:
             canvas = bg_img.copy()
@@ -1605,48 +1876,69 @@ class MainWindow(QMainWindow):
             for pkg in sorted(pkgs, key=lambda p: p.get("z", 0)):
                 src_bgra = pkg["img_bgra"]
                 mask = pkg["mask"]
+                mode = pkg["mode"]
+                do_harmonize = bool(pkg.get("harmonize", False))
+                do_seam_repair = bool(pkg.get("seam_repair", False))
                 cx, cy = pkg["center"]
                 cx = int(max(0, min(w - 1, cx)))
                 cy = int(max(0, min(h - 1, cy)))
 
-                # 与导出逻辑一致，泊松融合前对越界部分进行裁剪
-                sh, sw = src_bgra.shape[:2]
-                x0 = cx - sw // 2
-                y0 = cy - sh // 2
-                x1 = x0 + sw
-                y1 = y0 + sh
-                ix0 = max(0, x0)
-                iy0 = max(0, y0)
-                ix1 = min(w, x1)
-                iy1 = min(h, y1)
-                if ix0 >= ix1 or iy0 >= iy1:
-                    continue
-                sx0 = ix0 - x0
-                sy0 = iy0 - y0
-                sx1 = sx0 + (ix1 - ix0)
-                sy1 = sy0 + (iy1 - iy0)
-                src_crop = src_bgra[sy0:sy1, sx0:sx1]
-                mask_crop = mask[sy0:sy1, sx0:sx1]
-                center = ((ix0 + ix1) // 2, (iy0 + iy1) // 2)
+                if mode == BlendMode.PASTE:
+                    # PASTE 模式进入 HQ 预览仅因为有后处理
+                    canvas = MainWindow._alpha_paste(canvas, src_bgra, cx, cy)
+                else:
+                    # 泊松融合：裁剪避免越界
+                    sh, sw = src_bgra.shape[:2]
+                    x0 = cx - sw // 2
+                    y0 = cy - sh // 2
+                    x1, y1 = x0 + sw, y0 + sh
+                    ix0, iy0 = max(0, x0), max(0, y0)
+                    ix1, iy1 = min(w, x1), min(h, y1)
+                    if ix0 >= ix1 or iy0 >= iy1:
+                        continue
+                    sx0, sy0 = ix0 - x0, iy0 - y0
+                    sx1 = sx0 + (ix1 - ix0)
+                    sy1 = sy0 + (iy1 - iy0)
+                    src_crop = src_bgra[sy0:sy1, sx0:sx1]
+                    mask_crop = mask[sy0:sy1, sx0:sx1]
+                    center = ((ix0 + ix1) // 2, (iy0 + iy1) // 2)
+                    src_bgr = src_crop[:, :, :3]
+                    mask_255 = (mask_crop > 0).astype(np.uint8) * 255
+                    flag = (
+                        cv2.NORMAL_CLONE
+                        if mode == BlendMode.POISSON_NORMAL
+                        else cv2.MIXED_CLONE
+                    )
+                    try:
+                        canvas = cv2.seamlessClone(
+                            src_bgr,
+                            canvas,
+                            mask_255,
+                            center,
+                            flag,
+                        )
+                    except cv2.error:
+                        canvas = MainWindow._alpha_paste(
+                            canvas,
+                            src_bgra,
+                            cx,
+                            cy,
+                        )
 
-                src_bgr = src_crop[:, :, :3]
-                mask_255 = (mask_crop > 0).astype(np.uint8) * 255
-                flag = (
-                    cv2.NORMAL_CLONE
-                    if pkg["mode"] == BlendMode.POISSON_NORMAL
-                    else cv2.MIXED_CLONE
-                )
-                try:
-                    canvas = cv2.seamlessClone(src_bgr, canvas, mask_255, center, flag)
-                except cv2.error:
-                    # 失败降级：透明贴图
-                    src_roi = src_crop
-                    dst_roi = canvas[iy0:iy1, ix0:ix1]
-                    alpha = (src_roi[:, :, 3:4].astype(np.float32)) / 255.0
-                    dst_roi_f = dst_roi.astype(np.float32)
-                    src_rgb_f = src_roi[:, :, :3].astype(np.float32)
-                    blend = src_rgb_f * alpha + dst_roi_f * (1.0 - alpha)
-                    canvas[iy0:iy1, ix0:ix1] = np.clip(blend, 0, 255).astype(np.uint8)
+                # ---- 后处理 ----
+                if do_harmonize or do_seam_repair:
+                    fg_mask = MainWindow._project_fg_mask(
+                        h,
+                        w,
+                        src_bgra,
+                        cx,
+                        cy,
+                    )
+                    if np.any(fg_mask > 0):
+                        if do_harmonize:
+                            canvas = harmonize_region(canvas, fg_mask)
+                        if do_seam_repair:
+                            canvas = repair_seam(canvas, fg_mask)
             return serial, canvas
 
         # 运行（线程池）
@@ -1657,6 +1949,9 @@ class MainWindow(QMainWindow):
             try:
                 result_serial, canvas = fut.result()
             except Exception:
+                import traceback
+                print(f"[HQ Preview] 异步任务失败:\n"
+                      f"{traceback.format_exc()}")
                 return
             self._hq_signals.finished.emit(result_serial, canvas)
 
@@ -1670,9 +1965,9 @@ class MainWindow(QMainWindow):
         qimg = cv_to_qimage_bgra(cv2.cvtColor(canvas, cv2.COLOR_BGR2BGRA))
         self.hq_overlay_item.setPixmap(QPixmap.fromImage(qimg))
         self.hq_overlay_item.setVisible(True)
-        # 隐藏泊松项，避免与覆盖层重复
-        for m in self.material_items:
-            m.setVisible(m.blend_mode == BlendMode.PASTE)
+        # HQ overlay 的 z-value=9000 在素材之上，视觉上覆盖了素材，
+        # 但 overlay 不接收鼠标事件（NoButton），点击会穿透到下方素材。
+        # 因此无需改变素材的 opacity / visibility。
 
     # ------- 颜色调色板与叠加颜色按钮显示 -------
     def _set_tint_button_color(self, bgr: Optional[Tuple[int, int, int]]):
@@ -1722,6 +2017,135 @@ class MainWindow(QMainWindow):
         self._schedule_hq_preview()
         self._schedule_history_snapshot()
 
+    # ------- 套索填充（内容识别） -------
+    def _on_toggle_lasso_mode(self, checked: bool):
+        """进入/退出套索选区模式，与背景取色互斥。"""
+        if checked:
+            # 退出取色器模式（互斥）
+            self.view.enable_pick_background_color(False)
+            self.btn_pick_bg_color.setText("背景取色器(点击画面)")
+        self.view.enable_lasso_mode(checked)
+
+    def _on_lasso_completed(self, points: list):
+        """套索选区闭合后的处理入口。"""
+        if self.bg_bgr is None:
+            QMessageBox.warning(self, "警告", "请先加载背景图片。")
+            self.view.clear_lasso_path()
+            self.act_lasso_fill.setChecked(False)
+            return
+
+        # 将 QPointF 列表转换为 numpy 整数坐标
+        pts = np.array([[int(p.x()), int(p.y())] for p in points], dtype=np.int32)
+
+        # 弹出参数对话框
+        dlg = ContentAwareFillDialog(self)
+        params = dlg.get_params()
+
+        # 清除套索可视化并退出套索模式
+        self.view.clear_lasso_path()
+        self.act_lasso_fill.setChecked(False)
+
+        if params is None:
+            return
+
+        self._apply_content_aware_fill(pts, params)
+
+    def _apply_content_aware_fill(self, pts: np.ndarray, params: Dict[str, Any]):
+        """对背景图执行 PatchMatch 内容识别填充（异步，不阻塞 UI）。
+
+        Args:
+            pts (np.ndarray): 多边形顶点数组，shape (N, 2)，dtype int32。
+            params (dict): 填充参数，包含 patch_size / expand / backend。
+        """
+        # 应用用户选择的后端
+        backend: InpaintBackend = params.get("backend", InpaintBackend.AUTO)
+        set_backend(backend)
+
+        # 在修改前保存背景快照到历史（用于撤销）
+        state = self._capture_state()
+        state["bg_bgr_snapshot"] = self.bg_bgr.copy()
+        # 截断重做链并推入
+        if self.history_index < len(self.history) - 1:
+            self.history = self.history[: self.history_index + 1]
+        self.history.append(state)
+        if len(self.history) > 50:
+            self.history = self.history[-50:]
+        self.history_index = len(self.history) - 1
+
+        h, w = self.bg_bgr.shape[:2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(mask, [pts], 255)
+
+        # 选区扩展（膨胀 mask）
+        if params["expand"] > 0:
+            k = params["expand"]
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (k * 2 + 1, k * 2 + 1)
+            )
+            mask = cv2.dilate(mask, kernel, iterations=1)
+
+        # 异步执行内容识别填充
+        backend_name = _get_backend_name()
+        print(f"[Content-Aware Fill] 使用后端: {backend_name}")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self.statusBar().showMessage(f"内容识别填充中 ({backend_name})…")
+
+        # 禁用套索操作，防止重复提交
+        self.act_lasso_fill.setEnabled(False)
+
+        img_copy = self.bg_bgr.copy()
+        patch_size = params["patch_size"]
+        max_size = params.get("max_size", 0)
+        signals = self._inpaint_signals
+
+        def _task():
+            """在线程池中执行填充。"""
+            try:
+                result = patchmatch_inpaint(
+                    img_copy, mask, patch_size=patch_size, max_size=max_size
+                )
+                signals.finished.emit(result)
+            except Exception as exc:
+                signals.error.emit(str(exc))
+
+        self._inpaint_future = self.executor.submit(_task)
+
+    def _on_inpaint_finished(self, result: np.ndarray):
+        """内容识别填充完成回调（主线程）。
+
+        Args:
+            result (np.ndarray): 填充结果 BGR uint8.
+        """
+        QApplication.restoreOverrideCursor()
+        self.act_lasso_fill.setEnabled(True)
+        self.statusBar().showMessage("内容识别填充完成", 3000)
+        self._inpaint_future = None
+
+        self.bg_bgr = result
+        self._refresh_bg_display()
+        self._disable_hq_overlay()
+        self._schedule_hq_preview()
+
+    def _on_inpaint_error(self, msg: str):
+        """内容识别填充失败回调（主线程）。
+
+        Args:
+            msg (str): 错误信息.
+        """
+        QApplication.restoreOverrideCursor()
+        self.act_lasso_fill.setEnabled(True)
+        self.statusBar().showMessage("内容识别填充失败", 3000)
+        self._inpaint_future = None
+        QMessageBox.critical(self, "内容识别填充失败", msg)
+
+    def _refresh_bg_display(self):
+        """根据当前 bg_bgr 刷新背景显示（不从文件重新加载）。"""
+        if self.bg_bgr is None:
+            return
+        qimg = cv_to_qimage_bgra(cv2.cvtColor(self.bg_bgr, cv2.COLOR_BGR2BGRA))
+        pix = QPixmap.fromImage(qimg)
+        self.bg_pix_item.setPixmap(pix)
+
     # ------- 图层顺序控制 -------
     def _rebuild_right_list(self, select_item: Optional[MaterialItem] = None):
         self.list_added.clear()
@@ -1766,10 +2190,15 @@ class MainWindow(QMainWindow):
             self.scene.removeItem(m)
         self.material_items.clear()
         self.list_added.clear()
-        # 背景
-        bg_idx = state.get("bg_index", -1)
-        if 0 <= bg_idx < len(self.bg_list):
-            self._set_bg_index(bg_idx)
+        # 背景（优先从快照恢复，否则从文件加载）
+        bg_snapshot = state.get("bg_bgr_snapshot", None)
+        if bg_snapshot is not None:
+            self.bg_bgr = bg_snapshot.copy()
+            self._refresh_bg_display()
+        else:
+            bg_idx = state.get("bg_index", -1)
+            if 0 <= bg_idx < len(self.bg_list):
+                self._set_bg_index(bg_idx)
         # 材质（先按 z 排序，再按索引保证稳定顺序）
         materials = state.get("materials", [])
         materials_sorted = sorted(materials, key=lambda s: s.get("z", 0))
@@ -1803,6 +2232,8 @@ class MainWindow(QMainWindow):
             m.set_hue_shift(int(sd.get("hue_shift", 0)))
             m.set_saturation(int(sd.get("saturation", 100)))
             m.set_gaussian_blur_radius(int(sd.get("gaussian_blur_radius", 0)))
+            m.seam_repair = bool(sd.get("seam_repair", False))
+            m.harmonize = bool(sd.get("harmonize", False))
             self.material_items.append(m)
         self._rebuild_right_list()
         self._disable_hq_overlay()
