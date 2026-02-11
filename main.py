@@ -1,3 +1,4 @@
+import math
 import os
 import random
 import sys
@@ -355,6 +356,116 @@ class GLGraphicsView(QGraphicsView):
         self.mouseReleased.emit()
 
 
+class RotationHandleItem(QGraphicsItem):
+    """选中素材四角处的弧形旋转箭头，拖拽以中心为基准旋转。"""
+
+    HANDLE_SIZE = 28
+
+    def __init__(self, parent_item: "MaterialItem", corner: int):
+        super().__init__(parent_item)
+        self._parent_material = parent_item
+        self._corner = corner  # 0=左上, 1=右上, 2=右下, 3=左下
+        self._dragging = False
+        self._drag_start_angle: Optional[float] = None
+        self._drag_start_rot: Optional[int] = None
+        self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        self.setZValue(100)
+
+    def _center_scene(self) -> QPointF:
+        b = self._parent_material.boundingRect()
+        return self._parent_material.mapToScene(b.center())
+
+    def _point_to_angle_deg(self, scene_pos: QPointF) -> float:
+        c = self._center_scene()
+        dx = scene_pos.x() - c.x()
+        dy = scene_pos.y() - c.y()
+        if dx == 0 and dy == 0:
+            return 0.0
+        return math.degrees(math.atan2(-dy, dx))
+
+    def boundingRect(self) -> QRectF:
+        return QRectF(0, 0, self.HANDLE_SIZE, self.HANDLE_SIZE)
+
+    def shape(self) -> QPainterPath:
+        path = QPainterPath()
+        path.addEllipse(0, 0, self.HANDLE_SIZE, self.HANDLE_SIZE)
+        return path
+
+    def paint(self, painter: QPainter, option, widget) -> None:
+        path = self._arrow_path()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor(220, 60, 60), 2))
+        painter.setBrush(QColor(220, 60, 60, 180))
+        painter.drawPath(path)
+
+    def _arrow_path(self) -> QPainterPath:
+        s = self.HANDLE_SIZE
+        r = s * 0.35
+        cx, cy = s / 2, s / 2
+        rot = self._corner * 90
+        start_deg = 210 + rot
+        path = QPainterPath()
+        path.moveTo(cx + r * math.cos(math.radians(start_deg)), cy - r * math.sin(math.radians(start_deg)))
+        path.arcTo(2, 2, s - 4, s - 4, start_deg, -240)
+        tip_deg = start_deg - 240
+        tip_x = cx + r * math.cos(math.radians(tip_deg))
+        tip_y = cy - r * math.sin(math.radians(tip_deg))
+        wing = 5
+        path.moveTo(tip_x, tip_y)
+        path.lineTo(tip_x - wing * math.cos(math.radians(tip_deg - 22)), tip_y + wing * math.sin(math.radians(tip_deg - 22)))
+        path.lineTo(tip_x - wing * 0.5 * math.cos(math.radians(tip_deg)), tip_y + wing * 0.5 * math.sin(math.radians(tip_deg)))
+        path.lineTo(tip_x - wing * math.cos(math.radians(tip_deg + 22)), tip_y + wing * math.sin(math.radians(tip_deg + 22)))
+        path.closeSubpath()
+        return path
+
+    def _update_pos(self) -> None:
+        b = self._parent_material.boundingRect()
+        o = 4
+        if self._corner == 0:
+            self.setPos(b.left() - o - self.HANDLE_SIZE, b.top() - o - self.HANDLE_SIZE)
+        elif self._corner == 1:
+            self.setPos(b.right() + o, b.top() - o - self.HANDLE_SIZE)
+        elif self._corner == 2:
+            self.setPos(b.right() + o, b.bottom() + o)
+        else:
+            self.setPos(b.left() - o - self.HANDLE_SIZE, b.bottom() + o)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            self._drag_start_angle = self._point_to_angle_deg(event.scenePos())
+            self._drag_start_rot = self._parent_material.rotation_deg
+            if self._parent_material.host:
+                self._parent_material.host._on_item_interaction_started(self._parent_material)
+                self._parent_material.host._disable_hq_overlay()
+            event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._dragging and self._drag_start_angle is not None and self._drag_start_rot is not None:
+            cur = self._point_to_angle_deg(event.scenePos())
+            delta = cur - self._drag_start_angle
+            new_rot = (self._drag_start_rot + int(round(delta))) % 360
+            self._parent_material.set_rotation_deg(new_rot)
+            if self._parent_material.host:
+                self._parent_material.host._sync_rotation_from_item(self._parent_material)
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            self._drag_start_angle = None
+            self._drag_start_rot = None
+            if self._parent_material.host:
+                self._parent_material.host._on_item_interaction_finished(self._parent_material)
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+
 class MaterialItem(QGraphicsPixmapItem):
     def __init__(self, name: str, path: str, src_bgra: np.ndarray, host: "MainWindow"):
         super().__init__()
@@ -382,7 +493,15 @@ class MaterialItem(QGraphicsPixmapItem):
         self.seam_repair = False  # 接缝修复（LaMa/inpaint）
         self.harmonize = False  # 色调协调
         self.host = host
+        self._rotation_handles = [
+            RotationHandleItem(self, i) for i in range(4)
+        ]
         self._update_pix()
+
+    def _update_rotation_handles(self) -> None:
+        for h in self._rotation_handles:
+            h._update_pos()
+            h.setVisible(self.isSelected())
 
     def _make_display_qpixmap(self) -> QPixmap:
         img = self._make_transformed_bgra_for_display()
@@ -458,6 +577,7 @@ class MaterialItem(QGraphicsPixmapItem):
         self.setPixmap(self._make_display_qpixmap())
         b = self.boundingRect()
         self.setTransformOriginPoint(b.center())
+        self._update_rotation_handles()
 
     def set_blend_mode(self, mode: int):
         self.blend_mode = mode
@@ -571,6 +691,13 @@ class MaterialItem(QGraphicsPixmapItem):
             and self.host is not None
         ):
             self.host._on_item_interaction_finished(self)
+        elif change == QGraphicsItem.GraphicsItemChange.ItemSelectedChange:
+            visible = bool(value)
+            for h in self._rotation_handles:
+                h._update_pos()
+                h.setVisible(visible)
+        elif change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+            self._update_rotation_handles()
         return super().itemChange(change, value)
 
     def mousePressEvent(self, event):
@@ -2362,6 +2489,17 @@ class MainWindow(QMainWindow):
     def _on_item_interaction_finished(self, m: MaterialItem):
         self._schedule_history_snapshot()
         self._schedule_hq_preview()
+
+    def _sync_rotation_from_item(self, m: MaterialItem) -> None:
+        """从画布旋转手柄拖拽时同步到属性面板。"""
+        if m != self._current_item():
+            return
+        self._suppress_ui = True
+        try:
+            self.sld_rot.setValue(m.rotation_deg)
+            self.spn_rot.setValue(m.rotation_deg)
+        finally:
+            self._suppress_ui = False
 
 
 def print_basic_usage():
