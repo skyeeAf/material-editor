@@ -1,0 +1,14 @@
+# ===========================================================
+# 构建依赖（仅打包时需要）
+# ===========================================================
+# PyInstaller 是将 PySide6 桌面程序打包为 .app/.exe 的必要第三方工具。
+# Nuitka 是另一套编译式打包工具；ordered-set 和 zstandard 用于提升 Nuitka 构建性能。
+# 在线安装：
+#   python -m pip install -r requirements-build.txt
+# 离线安装：
+#   python -m pip download pyinstaller nuitka ordered-set zstandard -d wheels
+#   python -m pip install --no-index --find-links wheels pyinstaller nuitka ordered-set zstandard
+pyinstaller
+nuitka
+ordered-set
+zstandard

@@ -7,6 +7,31 @@
 - 在项目目录下运行：
   - `python main.py`
 
+### 编译打包
+
+本项目提供 PyInstaller 和 Nuitka 两套打包方式。PyInstaller 更轻量，Nuitka 更接近编译式打包但构建更慢。
+
+- 安装运行依赖与构建依赖：
+  - `python -m pip install -r requirements.txt`
+  - `python -m pip install -r requirements-build.txt`
+- 在目标系统本机执行构建：
+  - PyInstaller：`python build.py`
+  - Nuitka：`python build_nuitka.py`
+
+构建结果：
+
+- PyInstaller macOS Apple Silicon：`dist/MaterialEditor.app`
+- PyInstaller Windows x86_64：`dist/MaterialEditor/MaterialEditor.exe`
+- Nuitka macOS Apple Silicon：`dist-nuitka/MaterialEditor.app`
+- Nuitka Windows x86_64：`dist-nuitka/main.dist/MaterialEditor.exe`
+
+注意事项：
+
+- macOS 版本需在 Apple 芯片 Mac 上使用 arm64 Python 构建。
+- Windows 版本需在 64 位 Windows 上使用 64 位 Python 构建。
+- PyInstaller 和 Nuitka 都不能可靠地跨系统交叉打包，请分别在 macOS 和 Windows 上运行同一套构建脚本。
+- 当前打包脚本只内置核心功能（PySide6、numpy、OpenCV），不内置 LaMa、libcom、torch 等可选深度学习依赖。
+
 ### 界面布局
 
 - **左侧：素材列表**

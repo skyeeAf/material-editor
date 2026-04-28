@@ -1,6 +1,10 @@
 __pycache__/
 *.pyc
 *.pyd
+*.spec
+build/
+dist/
+dist-nuitka/
 background/
 material/
 models/
