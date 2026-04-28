@@ -40,7 +40,15 @@ def _validate_target_platform() -> str:
             raise RuntimeError("macOS 目标需要在 Apple 芯片 Mac 上构建。")
         return system_name
 
-    raise RuntimeError("仅支持在 Windows x86_64 或 macOS Apple Silicon 上构建。")
+    if system_name == "Linux":
+        machine = platform.machine().lower()
+        if machine not in {"x86_64", "amd64"}:
+            raise RuntimeError("Linux 目标需要使用 x86_64 环境构建。")
+        return system_name
+
+    raise RuntimeError(
+        "仅支持在 Windows x86_64、Linux x86_64 或 macOS Apple Silicon 上构建。"
+    )
 
 
 def _dist_target(system_name: str) -> Path:
@@ -95,8 +103,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     Args:
         argv (Sequence[str] | None): 预留的命令行参数序列，当前不会读取其内容。
+
     Returns:
         int: 进程退出码。
+
     Raises:
         RuntimeError: 当前平台或 Python 架构不符合目标构建要求。
         subprocess.CalledProcessError: PyInstaller 构建失败。

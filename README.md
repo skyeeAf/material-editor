@@ -22,8 +22,23 @@
 
 - PyInstaller macOS Apple Silicon：`dist/MaterialEditor.app`
 - PyInstaller Windows x86_64：`dist/MaterialEditor/MaterialEditor.exe`
+- PyInstaller Linux x86_64：`dist/MaterialEditor/MaterialEditor`
 - Nuitka macOS Apple Silicon：`dist-nuitka/MaterialEditor.app`
 - Nuitka Windows x86_64：`dist-nuitka/main.dist/MaterialEditor.exe`
+
+### GitHub Actions 自动构建
+
+仓库包含 GitHub Actions 工作流：`.github/workflows/build.yml`。
+
+- 推送到 `main` / `master` 分支时自动构建。
+- 提交 Pull Request 时自动构建。
+- 也可以在 GitHub 网页的 Actions 页面手动运行 `Build Desktop Apps`。
+
+CI 使用 PyInstaller 分别在 GitHub 的 Windows、Linux、macOS runner 上构建，并上传以下 artifacts：
+
+- `material-editor-windows-x86_64`
+- `material-editor-linux-x86_64`
+- `material-editor-macos-arm64`
 
 注意事项：
 

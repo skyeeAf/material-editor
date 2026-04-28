@@ -1,0 +1,92 @@
+name: Build Desktop Apps
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.artifact_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: material-editor-windows-x86_64
+            package_name: MaterialEditor-windows-x86_64.zip
+          - os: ubuntu-latest
+            artifact_name: material-editor-linux-x86_64
+            package_name: MaterialEditor-linux-x86_64.tar.gz
+          - os: macos-latest
+            artifact_name: material-editor-macos-arm64
+            package_name: MaterialEditor-macos-arm64.zip
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libegl1 \
+            libgl1 \
+            libxkbcommon-x11-0 \
+            libxcb-cursor0 \
+            libxcb-icccm4 \
+            libxcb-image0 \
+            libxcb-keysyms1 \
+            libxcb-randr0 \
+            libxcb-render-util0 \
+            libxcb-shape0 \
+            libxcb-sync1 \
+            libxcb-xfixes0 \
+            libxcb-xinerama0
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
+
+      - name: Build application
+        run: python build.py
+
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist\MaterialEditor -DestinationPath ${{ matrix.package_name }} -Force
+
+      - name: Package Linux artifact
+        if: runner.os == 'Linux'
+        run: tar -czf ${{ matrix.package_name }} -C dist MaterialEditor
+
+      - name: Package macOS artifact
+        if: runner.os == 'macOS'
+        run: cd dist && ditto -c -k --keepParent MaterialEditor.app ../${{ matrix.package_name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.package_name }}
+          if-no-files-found: error
+          retention-days: 14
