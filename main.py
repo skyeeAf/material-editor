@@ -7,29 +7,36 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QObject, QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
     QIcon,
     QImage,
+    QKeySequence,
     QPainter,
     QPainterPath,
     QPen,
     QPixmap,
+    QShortcut,
+    QMouseEvent,
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QAbstractItemView,
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QColorDialog,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
+    QFrame,
     QFormLayout,
     QGraphicsItem,
+    QGraphicsEllipseItem,
     QGraphicsPathItem,
     QGraphicsPixmapItem,
     QGraphicsScene,
@@ -42,9 +49,11 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QSplitter,
+    QTabWidget,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -208,6 +217,33 @@ def crop_to_alpha_bbox(img_bgra: np.ndarray) -> np.ndarray:
     return img_bgra[y0:y1, x0:x1]
 
 
+def _extract_polygon_bgra_from_bg(
+    bg_bgr: np.ndarray, pts_xy: np.ndarray
+) -> Tuple[np.ndarray, int, int]:
+    """从背景 BGR 图按多边形生成裁剪 bbox 的 BGRA（多边形内 alpha=255，无羽化）。"""
+    h, w = bg_bgr.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(mask, [pts_xy], 255)
+    ys, xs = np.where(mask > 0)
+    if xs.size == 0:
+        raise ValueError("多边形在画布范围内为空。")
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    crop_bgr = bg_bgr[y0:y1, x0:x1].copy()
+    crop_m = mask[y0:y1, x0:x1]
+    bgra = np.zeros((y1 - y0, x1 - x0, 4), dtype=np.uint8)
+    bgra[:, :, :3] = crop_bgr
+    bgra[:, :, 3] = crop_m
+    return bgra, x0, y0
+
+
+def _numpy_bgra_to_png_bytes(img_bgra: np.ndarray) -> bytes:
+    ok, buf = cv2.imencode(".png", img_bgra)
+    if not ok:
+        raise RuntimeError("PNG 编码失败。")
+    return buf.tobytes()
+
+
 class BlendMode:
     PASTE = 0
     POISSON_NORMAL = 1
@@ -228,13 +264,14 @@ class _InpaintSignals(QObject):
 
 
 class GLGraphicsView(QGraphicsView):
-    """自定义 QGraphicsView，支持缩放、背景取色和套索选区。"""
+    """自定义 QGraphicsView，支持缩放、背景取色、套索选区与钢笔多边形选区。"""
 
     zoomChanged = Signal(float)
     requestPickBackgroundColor = Signal(int, int)
     mousePressed = Signal()
     mouseReleased = Signal()
     lassoCompleted = Signal(list)
+    penDraftChanged = Signal(int, bool)
 
     def __init__(self, scene: QGraphicsScene, parent=None):
         super().__init__(scene, parent)
@@ -257,6 +294,14 @@ class GLGraphicsView(QGraphicsView):
         self._lasso_drawing = False
         self._lasso_points: List[QPointF] = []
         self._lasso_path_item: Optional[QGraphicsPathItem] = None
+        # 钢笔多边形（直线段锚点；点击起点闭合）
+        self._pen_mode = False
+        self._pen_points: List[QPointF] = []
+        self._pen_closed = False
+        self._pen_hover_scene_pos: Optional[QPointF] = None
+        self._pen_path_item: Optional[QGraphicsPathItem] = None
+        self._pen_start_marker: Optional[QGraphicsEllipseItem] = None
+        self._pen_close_radius_scene = 12.0
 
     def wheelEvent(self, event):
         angle = event.angleDelta().y()
@@ -286,6 +331,114 @@ class GLGraphicsView(QGraphicsView):
             self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
             self.setCursor(Qt.CursorShape.ArrowCursor)
             self.clear_lasso_path()
+
+    def enable_pen_mode(self, enable: bool):
+        """进入或退出钢笔多边形选区模式。
+
+        Args:
+            enable (bool): True 为启用锚点折线并点击起点闭合；False 为退出并清除草稿。
+        """
+        self._pen_mode = enable
+        if not enable:
+            self.clear_pen_polygon()
+            if not self._lasso_mode and not self._picking_bg_color:
+                self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+            return
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def clear_pen_polygon(self):
+        """清除钢笔路径草稿与可视化。"""
+        self._pen_points.clear()
+        self._pen_closed = False
+        self._pen_hover_scene_pos = None
+        self._update_pen_visual()
+
+    def is_pen_polygon_closed(self) -> bool:
+        """是否已形成闭合多边形（可提交填充）。"""
+        return self._pen_closed and len(self._pen_points) >= 3
+
+    def get_pen_polygon_pts_numpy(self) -> np.ndarray:
+        """返回钢笔闭合多边形的顶点坐标（画布像素坐标）。
+
+        Returns:
+            np.ndarray: shape (N, 2), dtype int32.
+        """
+        return np.array(
+            [[int(round(p.x())), int(round(p.y()))] for p in self._pen_points],
+            dtype=np.int32,
+        )
+
+    def _sync_pen_start_marker(self) -> None:
+        """在可闭合阶段显示起点处的闭合提示圈。"""
+        ok = (
+            self._pen_mode
+            and len(self._pen_points) >= 3
+            and not self._pen_closed
+        )
+        if not ok:
+            if self._pen_start_marker is not None:
+                self.scene().removeItem(self._pen_start_marker)
+                self._pen_start_marker = None
+            return
+        p0 = self._pen_points[0]
+        r = self._pen_close_radius_scene
+        rect = QRectF(p0.x() - r, p0.y() - r, 2 * r, 2 * r)
+        if self._pen_start_marker is None:
+            item = QGraphicsEllipseItem(rect)
+            pen = QPen(QColor(40, 220, 120), 2)
+            pen.setCosmetic(True)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            item.setPen(pen)
+            item.setBrush(Qt.BrushStyle.NoBrush)
+            item.setZValue(10002)
+            self.scene().addItem(item)
+            self._pen_start_marker = item
+        else:
+            self._pen_start_marker.setRect(rect)
+
+    def _update_pen_visual(self) -> None:
+        """更新钢笔路径可视化。"""
+        self._sync_pen_start_marker()
+        if not self._pen_points:
+            if self._pen_path_item is not None:
+                self.scene().removeItem(self._pen_path_item)
+                self._pen_path_item = None
+            if self._pen_mode:
+                self.penDraftChanged.emit(0, False)
+            return
+        path = QPainterPath()
+        path.moveTo(self._pen_points[0])
+        for pt in self._pen_points[1:]:
+            path.lineTo(pt)
+        if self._pen_closed:
+            path.closeSubpath()
+        elif (
+            self._pen_hover_scene_pos is not None
+            and len(self._pen_points) >= 1
+        ):
+            path.lineTo(self._pen_hover_scene_pos)
+        pen = QPen(QColor(255, 180, 0, 230), 2, Qt.PenStyle.SolidLine)
+        pen.setCosmetic(True)
+        if self._pen_path_item is None:
+            self._pen_path_item = QGraphicsPathItem(path)
+            self._pen_path_item.setPen(pen)
+            self._pen_path_item.setBrush(QColor(255, 180, 0, 40))
+            self._pen_path_item.setZValue(10001)
+            self.scene().addItem(self._pen_path_item)
+        else:
+            self._pen_path_item.setPen(pen)
+            self._pen_path_item.setPath(path)
+            self._pen_path_item.setBrush(QColor(255, 180, 0, 40))
+        if self._pen_mode:
+            self.penDraftChanged.emit(len(self._pen_points), self._pen_closed)
+
+    def leaveEvent(self, event):
+        if self._pen_mode and not self._pen_closed:
+            self._pen_hover_scene_pos = None
+            self._update_pen_visual()
+        super().leaveEvent(event)
 
     def clear_lasso_path(self):
         """清除套索路径可视化。"""
@@ -319,6 +472,25 @@ class GLGraphicsView(QGraphicsView):
             scene_pos = self.mapToScene(event.position().toPoint())
             self.requestPickBackgroundColor.emit(int(scene_pos.x()), int(scene_pos.y()))
             return
+        if self._pen_mode and event.button() == Qt.MouseButton.LeftButton:
+            scene_pos = self.mapToScene(event.position().toPoint())
+            if self._pen_closed:
+                event.accept()
+                return
+            if len(self._pen_points) >= 3:
+                p0 = self._pen_points[0]
+                dx = scene_pos.x() - p0.x()
+                dy = scene_pos.y() - p0.y()
+                if (dx * dx + dy * dy) ** 0.5 <= self._pen_close_radius_scene:
+                    self._pen_closed = True
+                    self._pen_hover_scene_pos = None
+                    self._update_pen_visual()
+                    event.accept()
+                    return
+            self._pen_points.append(scene_pos)
+            self._update_pen_visual()
+            event.accept()
+            return
         if self._lasso_mode and event.button() == Qt.MouseButton.LeftButton:
             self.clear_lasso_path()
             self._lasso_drawing = True
@@ -329,6 +501,11 @@ class GLGraphicsView(QGraphicsView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._pen_mode and not self._pen_closed and self._pen_points:
+            self._pen_hover_scene_pos = self.mapToScene(event.position().toPoint())
+            self._update_pen_visual()
+            event.accept()
+            return
         if self._lasso_mode and self._lasso_drawing:
             scene_pos = self.mapToScene(event.position().toPoint())
             self._lasso_points.append(scene_pos)
@@ -467,7 +644,14 @@ class RotationHandleItem(QGraphicsItem):
 
 
 class MaterialItem(QGraphicsPixmapItem):
-    def __init__(self, name: str, path: str, src_bgra: np.ndarray, host: "MainWindow"):
+    def __init__(
+        self,
+        name: str,
+        path: str,
+        src_bgra: np.ndarray,
+        host: "MainWindow",
+        memory_png_bytes: Optional[bytes] = None,
+    ):
         super().__init__()
         self.setFlags(
             QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
@@ -477,12 +661,14 @@ class MaterialItem(QGraphicsPixmapItem):
         self.name = name
         self.path = path
         self.base_bgra = src_bgra  # original BGRA
+        self.memory_png_bytes = memory_png_bytes  # 用于撤销/重做内存素材；否则 None
         self.blend_mode = BlendMode.PASTE
         self.scale_ratio = 1.0
         self.rotation_deg = 0
         self.tint_color_bgr: Tuple[int, int, int] = (0, 0, 0)
         self.tint_alpha = 0.0  # 0~1
         self.mask_offset = 0  # >0 膨胀, <0 腐蚀
+        self.layer_mask_u8: Optional[np.ndarray] = None  # uint8，与 base_bgra 同尺寸；None 表示无图层蒙版
         self.strong_tint = False  # 强叠加模式
         self.feather_radius = 0  # 羽化半径 px (0~50)
         self.brightness = 0  # 亮度偏移 (-100~100)
@@ -496,6 +682,12 @@ class MaterialItem(QGraphicsPixmapItem):
         self._rotation_handles = [
             RotationHandleItem(self, i) for i in range(4)
         ]
+        hb_i, wb_i = src_bgra.shape[:2]
+        sr_i = float(self.scale_ratio)
+        self._geom_scaled_wh: Tuple[int, int] = (
+            max(1, int(round(wb_i * sr_i))),
+            max(1, int(round(hb_i * sr_i))),
+        )
         self._update_pix()
 
     def _update_rotation_handles(self) -> None:
@@ -509,6 +701,18 @@ class MaterialItem(QGraphicsPixmapItem):
 
     def _make_transformed_bgra_for_display(self) -> np.ndarray:
         img = self.base_bgra.copy()
+        if img.shape[2] >= 4:
+            alpha = img[:, :, 3].astype(np.float32)
+            if self.layer_mask_u8 is not None:
+                lm = self.layer_mask_u8
+                if lm.shape[:2] != img.shape[:2]:
+                    lm = cv2.resize(
+                        lm,
+                        (img.shape[1], img.shape[0]),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                alpha = alpha * (lm.astype(np.float32) / 255.0)
+            img[:, :, 3] = np.clip(alpha, 0, 255).astype(np.uint8)
         # 掩码腐蚀/膨胀（基于 alpha 通道）
         if self.mask_offset != 0 and img.shape[2] >= 4:
             alpha = img[:, :, 3]
@@ -555,14 +759,10 @@ class MaterialItem(QGraphicsPixmapItem):
                 fy=self.scale_ratio,
                 interpolation=cv2.INTER_LINEAR,
             )
+        self._geom_scaled_wh = (int(img.shape[1]), int(img.shape[0]))
         if self.rotation_deg % 360 != 0:
-            h, w = img.shape[:2]
-            M = cv2.getRotationMatrix2D((w / 2, h / 2), self.rotation_deg, 1.0)
-            cos, sin = abs(M[0, 0]), abs(M[0, 1])
-            nw = int((h * sin) + (w * cos))
-            nh = int((h * cos) + (w * sin))
-            M[0, 2] += (nw / 2) - w / 2
-            M[1, 2] += (nh / 2) - h / 2
+            sw_i, sh_i = self._geom_scaled_wh
+            nw, nh, M = self._rotation_dst_size_and_M(sw_i, sh_i)
             img = cv2.warpAffine(
                 img,
                 M,
@@ -575,8 +775,8 @@ class MaterialItem(QGraphicsPixmapItem):
 
     def _update_pix(self):
         self.setPixmap(self._make_display_qpixmap())
-        b = self.boundingRect()
-        self.setTransformOriginPoint(b.center())
+        # 原点固定在左上角，避免 TransformOrigin 在中心时与局部像素坐标不一致导致映射偏移。
+        self.setTransformOriginPoint(0.0, 0.0)
         self._update_rotation_handles()
 
     def set_blend_mode(self, mode: int):
@@ -598,6 +798,177 @@ class MaterialItem(QGraphicsPixmapItem):
     def set_mask_offset(self, v: int):
         self.mask_offset = int(max(-20, min(20, v)))
         self._update_pix()
+
+    def set_layer_mask_from_gray(self, gray: Optional[np.ndarray]) -> None:
+        """设置或替换图层蒙版（与像素图层 alpha 相乘；全局腐蚀/膨胀仍作用于合成后的 alpha）。
+
+        Args:
+            gray (np.ndarray, optional): 单通道 uint8，尺寸可与素材不一致（将线性缩放至素材尺寸）；None 表示移除图层蒙版。
+        """
+        if gray is None:
+            self.layer_mask_u8 = None
+            self._update_pix()
+            return
+        if gray.ndim == 3:
+            gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+        h, w = self.base_bgra.shape[:2]
+        if gray.shape[:2] != (h, w):
+            gray = cv2.resize(gray, (w, h), interpolation=cv2.INTER_LINEAR)
+        self.layer_mask_u8 = gray.astype(np.uint8)
+        self._update_pix()
+
+    def clear_layer_mask(self) -> None:
+        """移除当前素材的图层蒙版。"""
+        self.layer_mask_u8 = None
+        self._update_pix()
+
+    def apply_alpha_channel_as_layer_mask(self) -> None:
+        """使用当前像素图层自带的 Alpha 通道生成图层蒙版。
+
+        将 base_bgra 的透明度复制为图层蒙版并与像素 alpha 相乘；侧栏「掩码腐蚀/膨胀」仍作用于合成后的 alpha。
+
+        Note:
+            仅在像素图为四通道（BGRA）时生效；否则不调图层蒙版数据。
+        """
+        if self.base_bgra.ndim != 3 or self.base_bgra.shape[2] < 4:
+            return
+        self.set_layer_mask_from_gray(self.base_bgra[:, :, 3].copy())
+
+    def _rotation_dst_size_and_M(self, ws: int, hs: int) -> Tuple[int, int, np.ndarray]:
+        """输入缩放后图像宽高（列数、行数），返回 warpAffine 输出宽高与仿射矩阵 M。
+
+        Note:
+            cv2.warpAffine 所用 M 将缩放后的 **源图坐标** 映射到旋转后的 **目标图坐标**；
+            着色时对每个目标像素使用 invertAffineTransform(M) 得到源上的采样坐标。
+        """
+        w_f, h_f = float(ws), float(hs)
+        M = cv2.getRotationMatrix2D((w_f / 2.0, h_f / 2.0), float(self.rotation_deg), 1.0)
+        cos_r = abs(float(M[0, 0]))
+        sin_r = abs(float(M[0, 1]))
+        nw = int((h_f * sin_r) + (w_f * cos_r))
+        nh = int((h_f * cos_r) + (w_f * sin_r))
+        M = M.copy()
+        M[0, 2] += (nw / 2.0) - w_f / 2.0
+        M[1, 2] += (nh / 2.0) - h_f / 2.0
+        return nw, nh, M
+
+    def map_display_local_to_base_xy(
+        self, lx: float, ly: float
+    ) -> Optional[Tuple[float, float]]:
+        """将当前显示的 pixmap 局部坐标映射到 base_bgra 像素坐标。
+
+        Args:
+            lx (float): pixmap 内 x（与 QGraphicsPixmapItem 局部坐标一致）。
+            ly (float): pixmap 内 y。
+
+        Returns:
+            Optional[Tuple[float, float]]: base 坐标 (bx, by)；若落在画布外则返回 None。
+        """
+        sr = float(self.scale_ratio)
+        hb, wb = self.base_bgra.shape[:2]
+        sw, sh = self._geom_scaled_wh
+        if self.rotation_deg % 360 == 0:
+            if lx < -1e-6 or ly < -1e-6 or lx > sw - 1e-6 or ly > sh - 1e-6:
+                return None
+            sx, sy = lx, ly
+        else:
+            nw, nh, M = self._rotation_dst_size_and_M(sw, sh)
+            if lx < -1e-6 or ly < -1e-6 or lx > nw - 1e-6 or ly > nh - 1e-6:
+                return None
+            Mi = cv2.invertAffineTransform(M)
+            sx = float(Mi[0, 0]) * lx + float(Mi[0, 1]) * ly + float(Mi[0, 2])
+            sy = float(Mi[1, 0]) * lx + float(Mi[1, 1]) * ly + float(Mi[1, 2])
+        bx = sx / sr
+        by = sy / sr
+        if bx < -1e-3 or by < -1e-3 or bx > wb - 1 + 1e-3 or by > hb - 1 + 1e-3:
+            return None
+        return bx, by
+
+    def map_base_xy_to_display_local(
+        self, bx: float, by: float
+    ) -> Optional[Tuple[float, float]]:
+        """将 base_bgra 像素坐标映射到当前显示 pixmap 局部坐标。
+
+        Args:
+            bx (float): base 像素 x。
+            by (float): base 像素 y。
+
+        Returns:
+            Optional[Tuple[float, float]]: (lx, ly)；无效时返回 None。
+        """
+        sr = float(self.scale_ratio)
+        sw, sh = self._geom_scaled_wh
+        hb, wb = self.base_bgra.shape[:2]
+        if bx < -1e-3 or by < -1e-3 or bx > wb - 1 + 1e-3 or by > hb - 1 + 1e-3:
+            return None
+        sx = bx * sr
+        sy = by * sr
+        if sx < -1e-3 or sy < -1e-3 or sx > sw - 1 + 1e-3 or sy > sh - 1 + 1e-3:
+            return None
+        if self.rotation_deg % 360 == 0:
+            return sx, sy
+        nw, nh, M = self._rotation_dst_size_and_M(sw, sh)
+        lx = float(M[0, 0]) * sx + float(M[0, 1]) * sy + float(M[0, 2])
+        ly = float(M[1, 0]) * sx + float(M[1, 1]) * sy + float(M[1, 2])
+        if lx < -1e-3 or ly < -1e-3 or lx > nw - 1 + 1e-3 or ly > nh - 1 + 1e-3:
+            return None
+        return lx, ly
+
+    def ensure_layer_mask_editable(self) -> None:
+        """若尚无图层蒙版则创建与 base_bgra 同尺寸的纯白蒙版，便于画笔修改。"""
+        if self.layer_mask_u8 is None:
+            h, w = self.base_bgra.shape[:2]
+            self.layer_mask_u8 = np.full((h, w), 255, dtype=np.uint8)
+
+    def stamp_layer_mask_brush(
+        self,
+        cx: float,
+        cy: float,
+        radius: float,
+        flow: float,
+        erase: bool,
+        *,
+        redraw: bool = True,
+    ) -> None:
+        """在图层蒙版上盖印软边圆形笔触（类似 PS 蒙版橡皮擦/白色画笔）。
+
+        Args:
+            cx (float): 笔刷中心 x（base_bgra 分辨率下的像素坐标，可为小数）。
+            cy (float): 笔刷中心 y。
+            radius (float): 笔刷半径（像素，基于原始图层分辨率）。
+            flow (float): 单次盖印的流量强度，范围 0.0~1.0。
+            erase (bool): True 表示向黑色涂抹（隐藏）；False 表示向白色涂抹（显示）。
+            redraw (bool, optional, 默认值 True): False 时暂不刷新 pixmap，便于连续笔触末尾统一刷新。
+
+        Note:
+            硬边裁切为圆形支撑域，边缘为高斯衰减；与像素 alpha 相乘后仍会经过全局腐蚀/膨胀等后续步骤。
+        """
+        flow = float(max(0.0, min(1.0, flow)))
+        r = float(max(0.5, radius))
+        self.ensure_layer_mask_editable()
+        lm = self.layer_mask_u8
+        if lm is None:
+            return
+        hh, ww = lm.shape[:2]
+        x0 = max(0, int(math.floor(cx - r - 1)))
+        x1 = min(ww, int(math.ceil(cx + r + 1)))
+        y0 = max(0, int(math.floor(cy - r - 1)))
+        y1 = min(hh, int(math.ceil(cy + r + 1)))
+        if x0 >= x1 or y0 >= y1:
+            return
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        dist = np.sqrt((xx.astype(np.float32) - cx) ** 2 + (yy.astype(np.float32) - cy) ** 2)
+        sigma = max(r * 0.38, 0.5)
+        profile = np.exp(-(dist ** 2) / (2.0 * sigma * sigma))
+        profile = np.clip(profile, 0.0, 1.0)
+        profile[dist > r] = 0.0
+        blend = profile * flow
+        target = 0.0 if erase else 255.0
+        roi = lm[y0:y1, x0:x1].astype(np.float32)
+        roi = roi * (1.0 - blend) + target * blend
+        lm[y0:y1, x0:x1] = np.clip(roi, 0, 255).astype(np.uint8)
+        if redraw:
+            self._update_pix()
 
     def set_strong_tint(self, v: bool):
         self.strong_tint = bool(v)
@@ -657,7 +1028,7 @@ class MaterialItem(QGraphicsPixmapItem):
 
     def to_state_dict(self) -> Dict[str, Any]:
         """序列化为状态字典（用于保存/撤销）。"""
-        return {
+        d: Dict[str, Any] = {
             "name": self.name,
             "path": self.path,
             "pos": (float(self.scenePos().x()), float(self.scenePos().y())),
@@ -678,6 +1049,13 @@ class MaterialItem(QGraphicsPixmapItem):
             "seam_repair": bool(self.seam_repair),
             "harmonize": bool(self.harmonize),
         }
+        if self.memory_png_bytes is not None:
+            d["memory_png_bytes"] = self.memory_png_bytes
+        if self.layer_mask_u8 is not None:
+            ok, buf = cv2.imencode(".png", self.layer_mask_u8)
+            if ok:
+                d["layer_mask_png_bytes"] = buf.tobytes()
+        return d
 
     def itemChange(self, change, value):
         if (
@@ -838,9 +1216,21 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self._connect_signals()
 
+        self._shortcut_pen_fill = QShortcut(QKeySequence("Ctrl+Return"), self)
+        self._shortcut_pen_fill.setContext(Qt.ShortcutContext.WindowShortcut)
+        self._shortcut_pen_fill.activated.connect(self._on_pen_ctrl_enter)
+
+        self.view.viewport().installEventFilter(self)
+
         # state
         self.material_items: List[MaterialItem] = []
         self._suppress_ui = False
+        self._mask_paint_dragging = False
+        self._mask_paint_last_base: Optional[Tuple[float, float]] = None
+        self._mask_paint_target: Optional[MaterialItem] = None
+        self._mask_brush_erase = True
+        self._mask_brush_cursor_item: Optional[QGraphicsEllipseItem] = None
+        self._mask_brush_last_view_pos: Optional[QPointF] = None
 
         # high-quality preview controls
         self.hq_enabled = False
@@ -868,6 +1258,8 @@ class MainWindow(QMainWindow):
         self.hist_timer.setInterval(400)
         self.hist_timer.timeout.connect(self._push_history)
 
+        self._refresh_layer_mask_paint_controls_enabled()
+
         # 初始历史
         self._push_history()
 
@@ -887,6 +1279,12 @@ class MainWindow(QMainWindow):
         self.act_random_generate = QAction("随机生成素材", self)
         self.act_lasso_fill = QAction("套索填充", self)
         self.act_lasso_fill.setCheckable(True)
+        self.act_pen_polygon = QAction("钢笔选区", self)
+        self.act_pen_polygon.setCheckable(True)
+        self.act_pen_polygon.setToolTip(
+            "单击画布加点连成折线；至少三个点后，单击起点旁的绿色虚线圈闭合；"
+            "闭合后按 Ctrl+Enter 弹出对话框，提取为素材并对背景做内容识别填充。"
+        )
         self.act_undo = QAction("撤销", self)
         self.act_undo.setShortcut("Ctrl+Z")
         self.act_redo = QAction("重做", self)
@@ -907,6 +1305,7 @@ class MainWindow(QMainWindow):
         tb.addAction(self.act_hq_preview)
         tb.addSeparator()
         tb.addAction(self.act_lasso_fill)
+        tb.addAction(self.act_pen_polygon)
         tb.addSeparator()
         tb.addAction(self.act_undo)
         tb.addAction(self.act_redo)
@@ -937,6 +1336,8 @@ class MainWindow(QMainWindow):
         self.list_added.setSelectionMode(
             QAbstractItemView.SelectionMode.SingleSelection
         )
+        self.list_added.setMinimumHeight(64)
+        self.list_added.setMaximumHeight(144)
 
         btn_row = QWidget()
         brl = QHBoxLayout(btn_row)
@@ -958,8 +1359,8 @@ class MainWindow(QMainWindow):
         top_l.addWidget(self.list_added)
         top_l.addWidget(btn_row)
 
-        props = QGroupBox("属性")
-        form = QFormLayout(props)
+        grp_tf = QGroupBox("变换与混合")
+        form_tf = QFormLayout(grp_tf)
         self.cmb_mode = QComboBox()
         self.cmb_mode.addItems(
             [
@@ -1031,13 +1432,77 @@ class MainWindow(QMainWindow):
         fl.addWidget(self.sld_feather, 1)
         fl.addWidget(self.spn_feather)
 
-        form.addRow("处理方式", self.cmb_mode)
-        form.addRow("旋转(°)", rot_row)
-        form.addRow("缩放(%)", scale_row)
-        form.addRow("颜色叠加", tint_row)
-        form.addRow("颜色透明度(%)", alpha_row)
-        form.addRow("掩码腐蚀/膨胀(px)", mask_row)
-        form.addRow("羽化(px)", feather_row)
+        form_tf.addRow("处理方式", self.cmb_mode)
+        form_tf.addRow("旋转(°)", rot_row)
+        form_tf.addRow("缩放(%)", scale_row)
+        form_tf.addRow("颜色叠加", tint_row)
+        form_tf.addRow("颜色透明度(%)", alpha_row)
+        form_tf.addRow("掩码腐蚀/膨胀(px)", mask_row)
+        lm_row = QWidget()
+        lml = QHBoxLayout(lm_row)
+        lml.setContentsMargins(0, 0, 0, 0)
+        self.lbl_layer_mask_status = QLabel("图层蒙版: 无")
+        self.btn_layer_mask_load = QPushButton("加载…")
+        self.btn_layer_mask_from_alpha = QPushButton("从 Alpha 生成")
+        self.btn_layer_mask_from_alpha.setToolTip(
+            "将素材像素自带的透明度通道复制为图层蒙版（与像素 alpha 相乘）。"
+        )
+        self.btn_layer_mask_clear = QPushButton("清除")
+        lml.addWidget(self.lbl_layer_mask_status, 1)
+        lml.addWidget(self.btn_layer_mask_load)
+        lml.addWidget(self.btn_layer_mask_from_alpha)
+        lml.addWidget(self.btn_layer_mask_clear)
+        self.chk_layer_mask_paint = QCheckBox("画笔编辑蒙版")
+        self.chk_layer_mask_paint.setToolTip(
+            "启用后在画布上用左键拖动涂抹图层蒙版：橡皮擦减小可见区，恢复笔刷增大可见区。"
+            "笔刷尺寸按素材原始分辨率像素计。"
+        )
+        mask_tool_row = QWidget()
+        mtl = QHBoxLayout(mask_tool_row)
+        mtl.setContentsMargins(0, 0, 0, 0)
+        self.btn_mask_brush_erase = QPushButton("橡皮擦")
+        self.btn_mask_brush_restore = QPushButton("恢复画笔")
+        self.btn_mask_brush_erase.setCheckable(True)
+        self.btn_mask_brush_restore.setCheckable(True)
+        self._grp_mask_brush_tool = QButtonGroup(self)
+        self._grp_mask_brush_tool.setExclusive(True)
+        self._grp_mask_brush_tool.addButton(self.btn_mask_brush_erase)
+        self._grp_mask_brush_tool.addButton(self.btn_mask_brush_restore)
+        self.btn_mask_brush_erase.setChecked(True)
+        mtl.addWidget(self.btn_mask_brush_erase)
+        mtl.addWidget(self.btn_mask_brush_restore)
+        mask_br_radius_row = QWidget()
+        mbrl = QHBoxLayout(mask_br_radius_row)
+        mbrl.setContentsMargins(0, 0, 0, 0)
+        self.sld_mask_br_radius = QSlider(Qt.Orientation.Horizontal)
+        self.sld_mask_br_radius.setRange(3, 200)
+        self.sld_mask_br_radius.setValue(28)
+        self.spn_mask_br_radius = QSpinBox()
+        self.spn_mask_br_radius.setRange(3, 200)
+        self.spn_mask_br_radius.setValue(28)
+        mbrl.addWidget(self.sld_mask_br_radius, 1)
+        mbrl.addWidget(self.spn_mask_br_radius)
+        mask_br_flow_row = QWidget()
+        mbfl = QHBoxLayout(mask_br_flow_row)
+        mbfl.setContentsMargins(0, 0, 0, 0)
+        self.sld_mask_br_flow = QSlider(Qt.Orientation.Horizontal)
+        self.sld_mask_br_flow.setRange(5, 100)
+        self.sld_mask_br_flow.setValue(65)
+        self.spn_mask_br_flow = QSpinBox()
+        self.spn_mask_br_flow.setRange(5, 100)
+        self.spn_mask_br_flow.setValue(65)
+        mbfl.addWidget(self.sld_mask_br_flow, 1)
+        mbfl.addWidget(self.spn_mask_br_flow)
+
+        grp_mk = QGroupBox("图层蒙版")
+        form_mk = QFormLayout(grp_mk)
+        form_mk.addRow("图层蒙版", lm_row)
+        form_mk.addRow(self.chk_layer_mask_paint)
+        form_mk.addRow("蒙版工具", mask_tool_row)
+        form_mk.addRow("笔刷半径(px)", mask_br_radius_row)
+        form_mk.addRow("流量(%)", mask_br_flow_row)
+
+        form_tf.addRow("羽化(px)", feather_row)
 
         # 后处理复选框 + 算法选择
         self.chk_harmonize = QCheckBox("色调协调")
@@ -1074,8 +1539,8 @@ class MainWindow(QMainWindow):
         seam_l.addWidget(self.chk_seam_repair)
         seam_l.addWidget(self.cmb_inpaint_backend, 1)
 
-        form.addRow("色调协调", harm_row)
-        form.addRow("接缝修复", seam_row)
+        form_tf.addRow("色调协调", harm_row)
+        form_tf.addRow("接缝修复", seam_row)
 
         # ---- 图像调整 GroupBox ----
         grp_adjust = QGroupBox("图像调整")
@@ -1156,10 +1621,40 @@ class MainWindow(QMainWindow):
         self.list_bgs = QListWidget()
         btm_l.addWidget(self.list_bgs)
 
-        vl.addWidget(grp_top)
-        vl.addWidget(props)
-        vl.addWidget(grp_adjust)
-        vl.addWidget(grp_bg)
+        tab_tf = QWidget()
+        v_tf = QVBoxLayout(tab_tf)
+        v_tf.setContentsMargins(0, 0, 0, 0)
+        v_tf.addWidget(grp_tf)
+
+        tab_mk = QWidget()
+        v_mk = QVBoxLayout(tab_mk)
+        v_mk.setContentsMargins(0, 0, 0, 0)
+        v_mk.addWidget(grp_mk)
+
+        tab_adj = QWidget()
+        v_adj = QVBoxLayout(tab_adj)
+        v_adj.setContentsMargins(0, 0, 0, 0)
+        v_adj.addWidget(grp_adjust)
+
+        tab_palette = QWidget()
+        v_pl = QVBoxLayout(tab_palette)
+        v_pl.setContentsMargins(0, 0, 0, 0)
+        v_pl.addWidget(grp_bg)
+
+        tabs = QTabWidget()
+        tabs.addTab(tab_tf, "变换")
+        tabs.addTab(tab_mk, "蒙版")
+        tabs.addTab(tab_adj, "图像")
+        tabs.addTab(tab_palette, "取色")
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(tabs)
+
+        vl.addWidget(grp_top, 0)
+        vl.addWidget(scroll, 2)
         vl.addWidget(grp_bottom, 1)
         return w
 
@@ -1235,10 +1730,270 @@ class MainWindow(QMainWindow):
         self.scene.selectionChanged.connect(self._on_scene_selection_changed)
 
         self.act_lasso_fill.toggled.connect(self._on_toggle_lasso_mode)
+        self.act_pen_polygon.toggled.connect(self._on_toggle_pen_mode)
         self.view.lassoCompleted.connect(self._on_lasso_completed)
+        self.view.penDraftChanged.connect(self._on_pen_draft_changed)
+
+        self.btn_layer_mask_load.clicked.connect(self._load_layer_mask_for_current_item)
+        self.btn_layer_mask_from_alpha.clicked.connect(
+            self._create_layer_mask_from_alpha_for_current_item,
+        )
+        self.btn_layer_mask_clear.clicked.connect(self._clear_layer_mask_for_current_item)
+
+        self.chk_layer_mask_paint.toggled.connect(self._on_toggle_layer_mask_paint)
+        self._grp_mask_brush_tool.buttonClicked.connect(self._on_mask_brush_tool_clicked)
+        self.sld_mask_br_radius.valueChanged.connect(self.spn_mask_br_radius.setValue)
+        self.spn_mask_br_radius.valueChanged.connect(self.sld_mask_br_radius.setValue)
+        self.sld_mask_br_flow.valueChanged.connect(self.spn_mask_br_flow.setValue)
+        self.spn_mask_br_flow.valueChanged.connect(self.sld_mask_br_flow.setValue)
+        self.spn_mask_br_radius.valueChanged.connect(self._on_mask_brush_param_changed)
+        self.spn_mask_br_flow.valueChanged.connect(self._on_mask_brush_param_changed)
+
+    def _on_mask_brush_param_changed(self, *_args: int) -> None:
+        """笔刷半径或流量变更时刷新场景上的预览圆。"""
+        if (
+            self.chk_layer_mask_paint.isChecked()
+            and self._mask_brush_last_view_pos is not None
+        ):
+            self._update_mask_brush_cursor_preview(self._mask_brush_last_view_pos)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        """视口事件过滤：蒙版画笔拖动绘制与笔刷范围预览。"""
+        if watched is self.view.viewport() and self.chk_layer_mask_paint.isChecked():
+            et = event.type()
+            if et == QEvent.Type.MouseMove and isinstance(event, QMouseEvent):
+                self._mask_brush_last_view_pos = QPointF(event.position())
+                self._update_mask_brush_cursor_preview(self._mask_brush_last_view_pos)
+                if self._mask_paint_dragging and (
+                    event.buttons() & Qt.MouseButton.LeftButton
+                ):
+                    self._apply_mask_brush_at_view_pos(event.position(), False)
+                    return True
+            if et == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self._mask_paint_dragging = True
+                    self._mask_paint_last_base = None
+                    self._apply_mask_brush_at_view_pos(event.position(), True)
+                    return True
+            if et == QEvent.Type.MouseButtonRelease and isinstance(event, QMouseEvent):
+                if event.button() == Qt.MouseButton.LeftButton and self._mask_paint_dragging:
+                    self._mask_paint_dragging = False
+                    self._mask_paint_last_base = None
+                    self._schedule_history_snapshot()
+                    self._schedule_hq_preview()
+                    return True
+        return super().eventFilter(watched, event)
+
+    def _mask_paint_viewport_to_scene(self, view_local: QPointF) -> QPointF:
+        # GL 视口下直接用 viewportTransform().map 可能与官方 mapToScene 不一致。
+        vx = int(round(view_local.x()))
+        vy = int(round(view_local.y()))
+        return self.view.mapToScene(vx, vy)
+
+    def _apply_mask_brush_at_view_pos(self, view_local: QPointF, first_stamp: bool) -> None:
+        """将视图坐标映射到素材 base 分辨率并盖印蒙版笔刷。"""
+        m = self._mask_paint_target
+        if m is None:
+            return
+        scene_pt = self._mask_paint_viewport_to_scene(view_local)
+        if not m.sceneBoundingRect().contains(scene_pt):
+            return
+        local = m.mapFromScene(scene_pt)
+        base_xy = m.map_display_local_to_base_xy(float(local.x()), float(local.y()))
+        if base_xy is None:
+            return
+        bx, by = base_xy
+        rad = float(self.spn_mask_br_radius.value())
+        flow = self.spn_mask_br_flow.value() / 100.0
+        erase = self._mask_brush_erase
+        if first_stamp or self._mask_paint_last_base is None:
+            m.stamp_layer_mask_brush(bx, by, rad, flow, erase, redraw=False)
+            self._mask_paint_last_base = (bx, by)
+        else:
+            x0, y0 = self._mask_paint_last_base
+            self._stroke_mask_brush_segment(m, x0, y0, bx, by, rad, flow, erase)
+            self._mask_paint_last_base = (bx, by)
+        m._update_pix()
+        self._disable_hq_overlay()
+        self._schedule_hq_preview()
+
+    def _stroke_mask_brush_segment(
+        self,
+        m: MaterialItem,
+        x0: float,
+        y0: float,
+        x1: float,
+        y1: float,
+        radius: float,
+        flow: float,
+        erase: bool,
+    ) -> None:
+        """在两点之间插值盖印，避免快速拖动出现空隙。"""
+        dx = x1 - x0
+        dy = y1 - y0
+        dist = math.hypot(dx, dy)
+        step = max(1.0, radius * 0.38)
+        n = max(1, int(math.ceil(dist / step)))
+        for i in range(n + 1):
+            t = i / n
+            m.stamp_layer_mask_brush(
+                x0 + t * dx,
+                y0 + t * dy,
+                radius,
+                flow,
+                erase,
+                redraw=False,
+            )
+
+    def _ensure_mask_brush_cursor_item(self) -> None:
+        """创建场景中跟随鼠标的笔刷范围预览圆（一次性）。"""
+        if self._mask_brush_cursor_item is not None:
+            return
+        it = QGraphicsEllipseItem()
+        pen = QPen(QColor(255, 235, 80), 1)
+        pen.setCosmetic(True)
+        it.setPen(pen)
+        it.setBrush(Qt.BrushStyle.NoBrush)
+        it.setZValue(10050)
+        it.setVisible(False)
+        self.scene.addItem(it)
+        self._mask_brush_cursor_item = it
+
+    def _remove_mask_brush_cursor_item(self) -> None:
+        """移除笔刷预览圆。"""
+        if self._mask_brush_cursor_item is None:
+            return
+        self.scene.removeItem(self._mask_brush_cursor_item)
+        self._mask_brush_cursor_item = None
+
+    def _update_mask_brush_cursor_preview(self, view_local: QPointF) -> None:
+        """根据视图坐标更新场景中笔刷圆的半径与中心。"""
+        if (
+            not self.chk_layer_mask_paint.isChecked()
+            or self._mask_brush_cursor_item is None
+        ):
+            return
+        m = self._mask_paint_target
+        if m is None:
+            self._mask_brush_cursor_item.setVisible(False)
+            return
+        scene_pt = self._mask_paint_viewport_to_scene(view_local)
+        if not m.sceneBoundingRect().contains(scene_pt):
+            self._mask_brush_cursor_item.setVisible(False)
+            return
+        local = m.mapFromScene(scene_pt)
+        base_xy = m.map_display_local_to_base_xy(float(local.x()), float(local.y()))
+        if base_xy is None:
+            self._mask_brush_cursor_item.setVisible(False)
+            return
+        bx, by = base_xy
+        r_base = float(self.spn_mask_br_radius.value())
+        ox = m.map_base_xy_to_display_local(bx + r_base, by)
+        oy = m.map_base_xy_to_display_local(bx, by + r_base)
+        if ox is None or oy is None:
+            self._mask_brush_cursor_item.setVisible(False)
+            return
+        p_c = m.mapToScene(QPointF(float(local.x()), float(local.y())))
+        p_rx = m.mapToScene(QPointF(ox[0], ox[1]))
+        p_ry = m.mapToScene(QPointF(oy[0], oy[1]))
+        rx = math.hypot(p_rx.x() - p_c.x(), p_rx.y() - p_c.y())
+        ry = math.hypot(p_ry.x() - p_c.x(), p_ry.y() - p_c.y())
+        r_scene = max(rx, ry, 1.0)
+        self._mask_brush_cursor_item.setRect(
+            QRectF(p_c.x() - r_scene, p_c.y() - r_scene, 2 * r_scene, 2 * r_scene)
+        )
+        self._mask_brush_cursor_item.setVisible(True)
+
+    def _on_toggle_layer_mask_paint(self, checked: bool) -> None:
+        """切换画布上手绘图层蒙版模式。"""
+        if checked:
+            self.act_lasso_fill.setChecked(False)
+            self.view.enable_lasso_mode(False)
+            self.act_pen_polygon.setChecked(False)
+            self.view.enable_pen_mode(False)
+            self.view.enable_pick_background_color(False)
+            self.btn_pick_bg_color.setText("背景取色器(点击画面)")
+            m = self._current_item()
+            if m is None:
+                QMessageBox.information(
+                    self, "提示", "请先选中一个素材后再使用蒙版画笔。"
+                )
+                self.chk_layer_mask_paint.setChecked(False)
+                return
+            m.ensure_layer_mask_editable()
+            self._populate_props_from_item(m)
+            self._mask_paint_target = m
+            m.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+            for h in m._rotation_handles:
+                h.setVisible(False)
+                h.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.view.setDragMode(QGraphicsView.DragMode.NoDrag)
+            self.view.setCursor(Qt.CursorShape.CrossCursor)
+            self.statusBar().showMessage(
+                "蒙版画笔：左键拖动绘制；橡皮擦变淡，恢复画笔变白。Esc 退出。笔刷半径按素材原始像素计。",
+                0,
+            )
+            self._refresh_layer_mask_paint_controls_enabled()
+            self._disable_hq_overlay()
+            self._schedule_hq_preview()
+            vp = self.view.viewport()
+            vp.setMouseTracking(True)
+            self._ensure_mask_brush_cursor_item()
+            return
+        vp = self.view.viewport()
+        vp.setMouseTracking(False)
+        self._mask_brush_last_view_pos = None
+        self._remove_mask_brush_cursor_item()
+        self.statusBar().clearMessage()
+        self._mask_paint_restore_interaction()
+        self._mask_paint_dragging = False
+        self._mask_paint_last_base = None
+        if (
+            not self.act_lasso_fill.isChecked()
+            and not self.act_pen_polygon.isChecked()
+        ):
+            self.view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+            if self.btn_pick_bg_color.text().startswith("退出"):
+                self.view.setCursor(Qt.CursorShape.CrossCursor)
+            else:
+                self.view.setCursor(Qt.CursorShape.ArrowCursor)
+        self._refresh_layer_mask_paint_controls_enabled()
+        self._schedule_hq_preview()
+        self._schedule_history_snapshot()
+
+    def _mask_paint_restore_interaction(self) -> None:
+        """恢复素材拖动与旋转手柄。"""
+        if self._mask_paint_target is None:
+            return
+        m = self._mask_paint_target
+        m.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        for h in m._rotation_handles:
+            h.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
+            h.setVisible(m.isSelected())
+        self._mask_paint_target = None
+
+    def _refresh_layer_mask_paint_controls_enabled(self) -> None:
+        """根据是否处于蒙版画笔模式启用/禁用工具参数控件。"""
+        on = self.chk_layer_mask_paint.isChecked()
+        self.btn_mask_brush_erase.setEnabled(on)
+        self.btn_mask_brush_restore.setEnabled(on)
+        self.sld_mask_br_radius.setEnabled(on)
+        self.spn_mask_br_radius.setEnabled(on)
+        self.sld_mask_br_flow.setEnabled(on)
+        self.spn_mask_br_flow.setEnabled(on)
+
+    def _on_mask_brush_tool_clicked(self, btn: QAbstractButton) -> None:
+        """切换橡皮擦 / 恢复画笔。"""
+        self._mask_brush_erase = btn is self.btn_mask_brush_erase
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
+            if self.chk_layer_mask_paint.isChecked():
+                self.chk_layer_mask_paint.setChecked(False)
+                return
+            if self.act_pen_polygon.isChecked():
+                self.act_pen_polygon.setChecked(False)
+                return
             if self.act_lasso_fill.isChecked():
                 self.act_lasso_fill.setChecked(False)
                 return
@@ -1388,6 +2143,8 @@ class MainWindow(QMainWindow):
         self._schedule_hq_preview()
 
     def _clear_materials(self):
+        if self.chk_layer_mask_paint.isChecked():
+            self.chk_layer_mask_paint.setChecked(False)
         for m in list(self.material_items):
             self.scene.removeItem(m)
         self.material_items.clear()
@@ -1819,6 +2576,11 @@ class MainWindow(QMainWindow):
             m.setSelected(i == row)
         self._populate_props_from_item(self._current_item())
 
+        if not self._suppress_ui and self.chk_layer_mask_paint.isChecked():
+            cur = self._current_item()
+            if cur is not self._mask_paint_target:
+                self.chk_layer_mask_paint.setChecked(False)
+
     def _on_scene_selection_changed(self):
         if self._suppress_ui:
             return
@@ -1833,6 +2595,10 @@ class MainWindow(QMainWindow):
         finally:
             self._suppress_ui = False
         self._populate_props_from_item(sel)
+
+        if not self._suppress_ui and self.chk_layer_mask_paint.isChecked():
+            if sel is not self._mask_paint_target:
+                self.chk_layer_mask_paint.setChecked(False)
 
     def _current_item(self) -> Optional[MaterialItem]:
         for m in self.material_items:
@@ -1864,6 +2630,8 @@ class MainWindow(QMainWindow):
                 self.sld_sat.setValue(100)
                 self.sld_gaussian.setValue(0)
                 self._set_tint_button_color(None)
+                self.lbl_layer_mask_status.setText("图层蒙版: —")
+                self.chk_layer_mask_paint.setEnabled(False)
                 return
             self.cmb_mode.setCurrentIndex(m.blend_mode)
             self.sld_rot.setValue(m.rotation_deg)
@@ -1881,8 +2649,13 @@ class MainWindow(QMainWindow):
             self.chk_seam_repair.setChecked(m.seam_repair)
             self.chk_harmonize.setChecked(m.harmonize)
             self._set_tint_button_color(m.tint_color_bgr if m.tint_alpha > 0 else None)
+            self.lbl_layer_mask_status.setText(
+                "图层蒙版: 已启用" if m.layer_mask_u8 is not None else "图层蒙版: 无"
+            )
         finally:
             self._suppress_ui = False
+            self.chk_layer_mask_paint.setEnabled(self._current_item() is not None)
+            self._refresh_layer_mask_paint_controls_enabled()
 
     def _apply_props_to_item(self):
         if self._suppress_ui:
@@ -1994,6 +2767,12 @@ class MainWindow(QMainWindow):
 
     def _toggle_pick_bg_color(self):
         enable = self.btn_pick_bg_color.text().startswith("背景取色器")
+        if enable:
+            self.chk_layer_mask_paint.setChecked(False)
+            self.act_lasso_fill.setChecked(False)
+            self.view.enable_lasso_mode(False)
+            self.act_pen_polygon.setChecked(False)
+            self.view.enable_pen_mode(False)
         self.view.enable_pick_background_color(enable)
         self.btn_pick_bg_color.setText("退出取色" if enable else "背景取色器(点击画面)")
 
@@ -2230,14 +3009,173 @@ class MainWindow(QMainWindow):
         self._schedule_hq_preview()
         self._schedule_history_snapshot()
 
-    # ------- 套索填充（内容识别） -------
+    # ------- 套索 / 钢笔填充（内容识别） -------
     def _on_toggle_lasso_mode(self, checked: bool):
         """进入/退出套索选区模式，与背景取色互斥。"""
         if checked:
+            self.chk_layer_mask_paint.setChecked(False)
+            self.act_pen_polygon.setChecked(False)
+            self.view.enable_pen_mode(False)
             # 退出取色器模式（互斥）
             self.view.enable_pick_background_color(False)
             self.btn_pick_bg_color.setText("背景取色器(点击画面)")
         self.view.enable_lasso_mode(checked)
+
+    def _on_toggle_pen_mode(self, checked: bool):
+        """进入/退出钢笔多边形模式；与套索、背景取色互斥。"""
+        if checked:
+            self.chk_layer_mask_paint.setChecked(False)
+            self.act_lasso_fill.setChecked(False)
+            self.view.enable_lasso_mode(False)
+            self.view.enable_pick_background_color(False)
+            self.btn_pick_bg_color.setText("背景取色器(点击画面)")
+        self.view.enable_pen_mode(checked)
+        if checked:
+            self.statusBar().showMessage(
+                "钢笔：单击添加锚点；至少三个点后，单击起点附近绿色虚线圈内以闭合；闭合后按 Ctrl+Enter。",
+                0,
+            )
+        else:
+            self.statusBar().clearMessage()
+
+    def _on_pen_draft_changed(self, n_vertices: int, closed: bool) -> None:
+        """钢笔草稿变更时刷新状态栏提示。"""
+        if not self.act_pen_polygon.isChecked():
+            return
+        if closed:
+            self.statusBar().showMessage(
+                "钢笔：路径已闭合，请按 Ctrl+Enter 提取素材并对背景做内容识别填充。",
+                0,
+            )
+            return
+        if n_vertices == 0:
+            self.statusBar().showMessage(
+                "钢笔：单击添加锚点；至少三个点后单击绿色虚线圈内的起点闭合；闭合后 Ctrl+Enter。",
+                0,
+            )
+            return
+        if n_vertices < 3:
+            self.statusBar().showMessage(
+                f"钢笔：已有 {n_vertices} 个锚点，继续单击添加（至少 3 个后方可闭合）。",
+                0,
+            )
+            return
+        self.statusBar().showMessage(
+            "钢笔：请将光标移到起点附近，单击闭合（绿色虚线圆）；闭合后按 Ctrl+Enter。",
+            0,
+        )
+
+    def _create_layer_mask_from_alpha_for_current_item(self) -> None:
+        """将选中素材当前的 Alpha 通道复制为图层蒙版。"""
+        m = self._current_item()
+        if m is None:
+            QMessageBox.information(self, "提示", "请先选择一个素材。")
+            return
+        if m.base_bgra.ndim != 3 or m.base_bgra.shape[2] < 4:
+            QMessageBox.information(self, "提示", "当前素材无 Alpha 通道，无法从透明度生成图层蒙版。")
+            return
+        m.apply_alpha_channel_as_layer_mask()
+        self._populate_props_from_item(m)
+        self._disable_hq_overlay()
+        self._schedule_hq_preview()
+        self._schedule_history_snapshot()
+
+    def _load_layer_mask_for_current_item(self) -> None:
+        """为当前选中素材从文件加载图层蒙版。"""
+        m = self._current_item()
+        if m is None:
+            QMessageBox.information(self, "提示", "请先选择一个素材。")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择图层蒙版图像",
+            os.getcwd(),
+            "图像 (*.png *.jpg *.jpeg *.bmp *.webp)",
+        )
+        if not path:
+            return
+        raw = np.fromfile(path, dtype=np.uint8)
+        img = cv2.imdecode(raw, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            QMessageBox.critical(self, "错误", f"无法读取文件: {path}")
+            return
+        m.set_layer_mask_from_gray(img)
+        self._populate_props_from_item(m)
+        self._disable_hq_overlay()
+        self._schedule_hq_preview()
+        self._schedule_history_snapshot()
+
+    def _clear_layer_mask_for_current_item(self) -> None:
+        """清除当前选中素材的图层蒙版。"""
+        m = self._current_item()
+        if m is None:
+            return
+        m.clear_layer_mask()
+        self._populate_props_from_item(m)
+        self._disable_hq_overlay()
+        self._schedule_hq_preview()
+        self._schedule_history_snapshot()
+
+    def _on_pen_ctrl_enter(self) -> None:
+        """钢笔闭合后 Ctrl+Enter：提取多边形区域为素材并异步内容识别填充。"""
+        if not self.act_pen_polygon.isChecked():
+            return
+        if self.bg_bgr is None:
+            QMessageBox.warning(self, "警告", "请先加载背景图片。")
+            return
+        if not self.view.is_pen_polygon_closed():
+            QMessageBox.information(
+                self,
+                "提示",
+                "请先依次点击锚点形成折线，再点击起点闭合（至少三个顶点），然后按 Ctrl+Enter。",
+            )
+            return
+        pts = self.view.get_pen_polygon_pts_numpy()
+        h, w = self.bg_bgr.shape[:2]
+        pts[:, 0] = np.clip(pts[:, 0], 0, w - 1)
+        pts[:, 1] = np.clip(pts[:, 1], 0, h - 1)
+
+        self._shortcut_pen_fill.setEnabled(False)
+        try:
+            dlg = ContentAwareFillDialog(self)
+            params = dlg.get_params()
+        finally:
+            self._shortcut_pen_fill.setEnabled(True)
+
+        self.view.clear_pen_polygon()
+        self.act_pen_polygon.setChecked(False)
+        self.view.enable_pen_mode(False)
+
+        if params is None:
+            return
+
+        backend: InpaintBackend = params.get("backend", InpaintBackend.AUTO)
+        set_backend(backend)
+
+        try:
+            src_bgra, x0, y0 = _extract_polygon_bgra_from_bg(self.bg_bgr, pts)
+        except ValueError as e:
+            QMessageBox.warning(self, "警告", str(e))
+            return
+
+        self._push_snapshot_for_inpaint()
+
+        idx = len(self.material_items) + 1
+        name = f"钢笔提取 {idx}"
+        mem_png = _numpy_bgra_to_png_bytes(src_bgra)
+        m = MaterialItem(name, "__memory__", src_bgra, self, memory_png_bytes=mem_png)
+        self.scene.addItem(m)
+        m.setZValue(len(self.material_items))
+        m.setPos(QPointF(float(x0), float(y0)))
+        self.material_items.append(m)
+        self._rebuild_right_list(select_item=m)
+        m.setSelected(True)
+
+        mask = self._polygon_to_inpaint_mask(pts, int(params["expand"]))
+        self._start_content_aware_inpaint_async(mask, params)
+
+        self._disable_hq_overlay()
+        self._schedule_hq_preview()
 
     def _on_lasso_completed(self, points: list):
         """套索选区闭合后的处理入口。"""
@@ -2263,21 +3201,10 @@ class MainWindow(QMainWindow):
 
         self._apply_content_aware_fill(pts, params)
 
-    def _apply_content_aware_fill(self, pts: np.ndarray, params: Dict[str, Any]):
-        """对背景图执行 PatchMatch 内容识别填充（异步，不阻塞 UI）。
-
-        Args:
-            pts (np.ndarray): 多边形顶点数组，shape (N, 2)，dtype int32。
-            params (dict): 填充参数，包含 patch_size / expand / backend。
-        """
-        # 应用用户选择的后端
-        backend: InpaintBackend = params.get("backend", InpaintBackend.AUTO)
-        set_backend(backend)
-
-        # 在修改前保存背景快照到历史（用于撤销）
+    def _push_snapshot_for_inpaint(self) -> None:
+        """在内容识别填充开始前写入历史快照（含 bg_bgr_snapshot）。"""
         state = self._capture_state()
         state["bg_bgr_snapshot"] = self.bg_bgr.copy()
-        # 截断重做链并推入
         if self.history_index < len(self.history) - 1:
             self.history = self.history[: self.history_index + 1]
         self.history.append(state)
@@ -2285,26 +3212,29 @@ class MainWindow(QMainWindow):
             self.history = self.history[-50:]
         self.history_index = len(self.history) - 1
 
+    def _polygon_to_inpaint_mask(self, pts: np.ndarray, expand_px: int) -> np.ndarray:
+        """由多边形顶点生成填充用单通道 mask（可选扩展）。"""
         h, w = self.bg_bgr.shape[:2]
         mask = np.zeros((h, w), dtype=np.uint8)
         cv2.fillPoly(mask, [pts], 255)
-
-        # 选区扩展（膨胀 mask）
-        if params["expand"] > 0:
-            k = params["expand"]
+        if expand_px > 0:
             kernel = cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE, (k * 2 + 1, k * 2 + 1)
+                cv2.MORPH_ELLIPSE, (expand_px * 2 + 1, expand_px * 2 + 1)
             )
             mask = cv2.dilate(mask, kernel, iterations=1)
+        return mask
 
-        # 异步执行内容识别填充
+    def _start_content_aware_inpaint_async(
+        self, mask: np.ndarray, params: Dict[str, Any]
+    ) -> None:
+        """对已构造的 mask 启动异步 PatchMatch 填充。"""
         backend_name = _get_backend_name()
         print(f"[Content-Aware Fill] 使用后端: {backend_name}")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         self.statusBar().showMessage(f"内容识别填充中 ({backend_name})…")
 
-        # 禁用套索操作，防止重复提交
         self.act_lasso_fill.setEnabled(False)
+        self.act_pen_polygon.setEnabled(False)
 
         img_copy = self.bg_bgr.copy()
         patch_size = params["patch_size"]
@@ -2323,6 +3253,20 @@ class MainWindow(QMainWindow):
 
         self._inpaint_future = self.executor.submit(_task)
 
+    def _apply_content_aware_fill(self, pts: np.ndarray, params: Dict[str, Any]):
+        """对背景图执行 PatchMatch 内容识别填充（异步，不阻塞 UI）。
+
+        Args:
+            pts (np.ndarray): 多边形顶点数组，shape (N, 2)，dtype int32。
+            params (dict): 填充参数，包含 patch_size / expand / backend。
+        """
+        backend: InpaintBackend = params.get("backend", InpaintBackend.AUTO)
+        set_backend(backend)
+
+        self._push_snapshot_for_inpaint()
+        mask = self._polygon_to_inpaint_mask(pts, int(params["expand"]))
+        self._start_content_aware_inpaint_async(mask, params)
+
     def _on_inpaint_finished(self, result: np.ndarray):
         """内容识别填充完成回调（主线程）。
 
@@ -2331,6 +3275,7 @@ class MainWindow(QMainWindow):
         """
         QApplication.restoreOverrideCursor()
         self.act_lasso_fill.setEnabled(True)
+        self.act_pen_polygon.setEnabled(True)
         self.statusBar().showMessage("内容识别填充完成", 3000)
         self._inpaint_future = None
 
@@ -2347,6 +3292,7 @@ class MainWindow(QMainWindow):
         """
         QApplication.restoreOverrideCursor()
         self.act_lasso_fill.setEnabled(True)
+        self.act_pen_polygon.setEnabled(True)
         self.statusBar().showMessage("内容识别填充失败", 3000)
         self._inpaint_future = None
         QMessageBox.critical(self, "内容识别填充失败", msg)
@@ -2418,11 +3364,30 @@ class MainWindow(QMainWindow):
         for i, sd in enumerate(materials_sorted):
             path = sd.get("path", "")
             name = sd.get("name", os.path.basename(path) if path else f"Item{i}")
-            try:
-                img = cv_imread_rgba(path)
-            except Exception:
-                continue
-            m = MaterialItem(name, path, img, self)
+            raw_mem = sd.get("memory_png_bytes")
+            mem_bytes: Optional[bytes] = (
+                bytes(raw_mem)
+                if isinstance(raw_mem, (bytes, bytearray)) and len(raw_mem) > 0
+                else None
+            )
+            img: Optional[np.ndarray] = None
+            if mem_bytes is not None:
+                img = cv2.imdecode(
+                    np.frombuffer(mem_bytes, dtype=np.uint8),
+                    cv2.IMREAD_UNCHANGED,
+                )
+                if img is None:
+                    continue
+                if img.ndim == 2:
+                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
+                elif img.shape[2] == 3:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+            else:
+                try:
+                    img = cv_imread_rgba(path)
+                except Exception:
+                    continue
+            m = MaterialItem(name, path, img, self, memory_png_bytes=mem_bytes)
             self.scene.addItem(m)
             m.setZValue(i)
             m.setPos(
@@ -2447,6 +3412,13 @@ class MainWindow(QMainWindow):
             m.set_gaussian_blur_radius(int(sd.get("gaussian_blur_radius", 0)))
             m.seam_repair = bool(sd.get("seam_repair", False))
             m.harmonize = bool(sd.get("harmonize", False))
+            lmb = sd.get("layer_mask_png_bytes")
+            if isinstance(lmb, (bytes, bytearray)) and len(lmb) > 0:
+                lm = cv2.imdecode(np.frombuffer(lmb, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+                if lm is not None:
+                    if lm.ndim == 3:
+                        lm = cv2.cvtColor(lm, cv2.COLOR_BGR2GRAY)
+                    m.set_layer_mask_from_gray(lm)
             self.material_items.append(m)
         self._rebuild_right_list()
         self._disable_hq_overlay()
@@ -2513,7 +3485,7 @@ def print_basic_usage():
 界面说明：
   左侧：素材列表（双击素材加入画布）
   中间：画布预览（滚轮缩放，按住左键拖动画布，点击/拖动素材）
-  右上：已添加素材 + 属性（旋转、缩放、颜色叠加、掩码腐蚀/膨胀、混合模式）
+  右上：已添加素材 + 属性（旋转、缩放、颜色叠加、图层蒙版、全局掩码腐蚀/膨胀、混合模式）
   右下：背景列表 + 背景取色器 / 一键提取背景主色
 
 工具栏常用按钮：
@@ -2524,11 +3496,14 @@ def print_basic_usage():
   - 一键导出：导出当前合成结果
   - 随机生成素材：按配置批量随机布置素材
   - 高质量预览：启用泊松融合高质量预览
+  - 套索填充：手绘闭合套索后内容识别填充（仅背景）
+  - 钢笔选区：锚点折线 + 点击起点闭合 + Ctrl+Enter，提取素材并填充背景
   - 撤销 / 重做：Ctrl+Z / Ctrl+Y
 
 提示：
   - 泊松融合 Normal / Mix 模式建议配合“高质量预览”使用。
   - 颜色叠加可配合“强叠加模式”和透明度滑条调节效果。
+  - 图层蒙版：文件加载 / 从 Alpha 生成 / 画布画笔编辑（橡皮与恢复） / 清除；画笔半径按素材原始像素计。
 ============================================
 """.strip()
     )
