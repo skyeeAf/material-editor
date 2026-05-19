@@ -87,6 +87,17 @@ def cv_imread_rgba(path: str) -> np.ndarray:
     return img  # BGRA
 
 
+def cv_imwrite_bgr(path: str, img_bgr: np.ndarray) -> bool:
+    _, ext = os.path.splitext(path)
+    if not ext:
+        ext = ".png"
+    ok, buf = cv2.imencode(ext, img_bgr)
+    if not ok:
+        return False
+    buf.tofile(path)
+    return True
+
+
 def cv_to_qimage_bgra(bgra: np.ndarray) -> QImage:
     h, w = bgra.shape[:2]
     return (
@@ -108,20 +119,6 @@ def tint_bgra(
     src = (1.0 - alpha) * src + alpha * overlay
     out[:, :, :3] = np.clip(src, 0, 255).astype(np.uint8)
     return out
-
-
-def dominant_color_bgr(img_bgr: np.ndarray, k: int = 4) -> Tuple[int, int, int]:
-    small = cv2.resize(img_bgr, (0, 0), fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
-    z = small.reshape((-1, 3)).astype(np.float32)
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
-    # 为避免静态类型检查器报错，提供初始 bestLabels
-    best_labels = np.empty((z.shape[0], 1), dtype=np.int32)
-    _, labels, centers = cv2.kmeans(
-        z, k, best_labels, criteria, 5, cv2.KMEANS_PP_CENTERS
-    )
-    counts = np.bincount(labels.flatten())
-    dom = centers[np.argmax(counts)]
-    return int(dom[0]), int(dom[1]), int(dom[2])
 
 
 def dominant_colors_bgr(img_bgr: np.ndarray, k: int = 5) -> List[Tuple[int, int, int]]:
@@ -147,6 +144,35 @@ def dominant_colors_bgr(img_bgr: np.ndarray, k: int = 5) -> List[Tuple[int, int,
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 MASK_SUFFIXES = ["_mask", "-mask", ".mask"]
+EXPORT_SAVE_FILTERS = "PNG (*.png);;JPEG (*.jpg *.jpeg)"
+
+
+def _extension_from_save_filter(selected_filter: str) -> str:
+    fl = selected_filter.lower()
+    if "jpeg" in fl or "jpg" in fl:
+        return ".jpg"
+    return ".png"
+
+
+def _ensure_export_extension(path: str, selected_filter: str) -> str:
+    _, ext = os.path.splitext(path)
+    if ext:
+        return path
+    return path + _extension_from_save_filter(selected_filter)
+
+
+def _suggest_export_save_path(directory: str, stem: str, ext: str) -> str:
+    if not ext.startswith("."):
+        ext = "." + ext
+    first = os.path.join(directory, stem + ext)
+    if not os.path.exists(first):
+        return first
+    n = 2
+    while True:
+        candidate = os.path.join(directory, f"{stem}{n}{ext}")
+        if not os.path.exists(candidate):
+            return candidate
+        n += 1
 
 
 def is_image_file(path: str) -> bool:
@@ -2157,11 +2183,26 @@ class MainWindow(QMainWindow):
         if self.bg_bgr is None:
             QMessageBox.information(self, "提示", "请先加载背景。")
             return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "导出图像", os.getcwd(), "PNG (*.png);;JPEG (*.jpg *.jpeg)"
+        default_filter = "PNG (*.png)"
+        default_ext = _extension_from_save_filter(default_filter)
+        if 0 <= self.current_bg_index < len(self.bg_list):
+            bg_path = self.bg_list[self.current_bg_index]
+            directory = os.path.dirname(bg_path) or os.getcwd()
+            stem = os.path.splitext(os.path.basename(bg_path))[0]
+        else:
+            directory = os.getcwd()
+            stem = "export"
+        default_path = _suggest_export_save_path(directory, stem, default_ext)
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "导出图像",
+            default_path,
+            EXPORT_SAVE_FILTERS,
+            default_filter,
         )
         if not path:
             return
+        path = _ensure_export_extension(path, selected_filter or default_filter)
         canvas = self._render_composite_high_quality(
             include_modes={
                 BlendMode.PASTE,
@@ -2171,7 +2212,7 @@ class MainWindow(QMainWindow):
                 BlendMode.KONTEXT_HARMONIZE,
             }
         )
-        ok = cv2.imwrite(path, canvas)
+        ok = cv_imwrite_bgr(path, canvas)
         if ok:
             QMessageBox.information(self, "完成", "导出成功。")
         else:
@@ -2247,10 +2288,6 @@ class MainWindow(QMainWindow):
                 return BlendMode.POISSON_NORMAL
             if m == "poisson_mixed":
                 return BlendMode.POISSON_MIXED
-            if m == "kontext_blend" and self._kontext_available:
-                return BlendMode.KONTEXT_BLEND
-            if m == "kontext_harm" and self._kontext_available:
-                return BlendMode.KONTEXT_HARMONIZE
             return BlendMode.PASTE
 
         def choose_color(x: int, y: int) -> Tuple[Tuple[int, int, int], float, bool]:
