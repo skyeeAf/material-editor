@@ -22,6 +22,7 @@ from PySide6.QtGui import (
     QMouseEvent,
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractButton,
     QAbstractItemView,
@@ -74,6 +75,159 @@ from patchmatch_inpaint import (
     set_backend,
 )
 from ui.dialogs import RandomGenerateDialog
+
+_ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "assets")
+_ROTATION_HANDLE_SVG = os.path.join(_ASSETS_DIR, "rotation_handle.svg")
+
+
+class WarpMode:
+    """素材扭曲模式。"""
+
+    NONE = 0
+    BULGE = 1
+    PINCH = 2
+    H_WAVE = 3
+    V_WAVE = 4
+    SHEAR = 5
+    CORNER = 6
+
+
+DEFAULT_WARP_CORNERS: Tuple[Tuple[float, float], ...] = (
+    (0.0, 0.0),
+    (1.0, 0.0),
+    (1.0, 1.0),
+    (0.0, 1.0),
+)
+
+
+def warp_corners_is_default(
+    corners: Tuple[Tuple[float, float], ...],
+) -> bool:
+    """判断四角是否仍为默认矩形。"""
+    for (a, b), (x, y) in zip(corners, DEFAULT_WARP_CORNERS):
+        if abs(a - x) > 1e-4 or abs(b - y) > 1e-4:
+            return False
+    return True
+
+
+def apply_algorithmic_warp(
+    bgra: np.ndarray,
+    mode: int,
+    amount: int,
+    freq: int,
+) -> np.ndarray:
+    """对图像施加算法扭曲（保持尺寸不变）。
+
+    Args:
+        bgra (np.ndarray): BGRA 输入。
+        mode (int): WarpMode 枚举值。
+        amount (int): 扭曲强度 0~100。
+        freq (int): 波浪周期（越大波纹越密）。
+
+    Returns:
+        np.ndarray: 扭曲后的 BGRA。
+    """
+    if mode == WarpMode.NONE or amount == 0:
+        return bgra
+    h, w = bgra.shape[:2]
+    amt = amount / 100.0
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+    cx, cy = (w - 1) * 0.5, (h - 1) * 0.5
+    max_r = max(1.0, math.hypot(cx, cy))
+    if mode == WarpMode.BULGE:
+        dx = xs - cx
+        dy = ys - cy
+        r = np.sqrt(dx * dx + dy * dy) / max_r
+        factor = 1.0 - amt * 0.65 * (1.0 - r * r)
+        map_x = cx + dx * factor
+        map_y = cy + dy * factor
+    elif mode == WarpMode.PINCH:
+        dx = xs - cx
+        dy = ys - cy
+        r = np.sqrt(dx * dx + dy * dy) / max_r
+        factor = 1.0 + amt * 0.65 * (1.0 - r * r)
+        map_x = cx + dx * factor
+        map_y = cy + dy * factor
+    elif mode == WarpMode.H_WAVE:
+        period = max(4.0, min(w, h) / max(1.0, float(freq)))
+        map_x = xs + amt * 18.0 * np.sin(ys / period * 2.0 * math.pi)
+        map_y = ys
+    elif mode == WarpMode.V_WAVE:
+        period = max(4.0, min(w, h) / max(1.0, float(freq)))
+        map_x = xs
+        map_y = ys + amt * 18.0 * np.sin(xs / period * 2.0 * math.pi)
+    elif mode == WarpMode.SHEAR:
+        map_x = xs + amt * 0.5 * (ys - cy)
+        map_y = ys + amt * 0.15 * (xs - cx)
+    else:
+        return bgra
+    return cv2.remap(
+        bgra,
+        map_x,
+        map_y,
+        cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0, 0),
+    )
+
+
+def apply_corner_perspective_warp(
+    bgra: np.ndarray,
+    corners_norm: Tuple[Tuple[float, float], ...],
+) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
+    """按四角归一化坐标做透视扭曲。
+
+    Args:
+        bgra (np.ndarray): BGRA 输入。
+        corners_norm (Tuple[Tuple[float, float], ...]): 四角 (u,v)，相对宽高的归一化坐标。
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray, Tuple[int, int]]: (结果图, 3x3 透视矩阵, (宽, 高))。
+    """
+    h, w = bgra.shape[:2]
+    src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+    dst = np.float32(
+        [
+            [corners_norm[0][0] * w, corners_norm[0][1] * h],
+            [corners_norm[1][0] * w, corners_norm[1][1] * h],
+            [corners_norm[2][0] * w, corners_norm[2][1] * h],
+            [corners_norm[3][0] * w, corners_norm[3][1] * h],
+        ]
+    )
+    min_xy = dst.min(axis=0)
+    max_xy = dst.max(axis=0)
+    dst_shift = dst - min_xy
+    out_w = max(1, int(math.ceil(max_xy[0] - min_xy[0])))
+    out_h = max(1, int(math.ceil(max_xy[1] - min_xy[1])))
+    m_fwd = cv2.getPerspectiveTransform(src, dst_shift)
+    warped = cv2.warpPerspective(
+        bgra,
+        m_fwd,
+        (out_w, out_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0, 0),
+    )
+    return warped, m_fwd, (out_w, out_h)
+
+
+def perspective_map_point(
+    m: np.ndarray, x: float, y: float, *, inverse: bool = False
+) -> Tuple[float, float]:
+    """用 3x3 透视矩阵映射一个点。
+
+    Args:
+        m (np.ndarray): 3x3 透视矩阵。
+        x (float): 输入 x。
+        y (float): 输入 y。
+        inverse (bool, optional, 默认值 False): True 时使用逆矩阵。
+
+    Returns:
+        Tuple[float, float]: 映射后的 (x, y)。
+    """
+    mat = np.linalg.inv(m) if inverse else m
+    v = mat @ np.array([x, y, 1.0], dtype=np.float64)
+    return float(v[0] / v[2]), float(v[1] / v[2])
 
 
 def cv_imread_rgba(path: str) -> np.ndarray:
@@ -560,9 +714,10 @@ class GLGraphicsView(QGraphicsView):
 
 
 class RotationHandleItem(QGraphicsItem):
-    """选中素材四角处的弧形旋转箭头，拖拽以中心为基准旋转。"""
+    """选中素材四角外侧的 SVG 旋转手柄，拖拽以旋转中心为基准旋转。"""
 
-    HANDLE_SIZE = 28
+    HANDLE_SIZE = 40
+    _svg_renderer: Optional[QSvgRenderer] = None
 
     def __init__(self, parent_item: "MaterialItem", corner: int):
         super().__init__(parent_item)
@@ -570,26 +725,40 @@ class RotationHandleItem(QGraphicsItem):
         self._corner = corner  # 0=左上, 1=右上, 2=右下, 3=左下
         self._dragging = False
         self._drag_start_angle: Optional[float] = None
-        self._drag_start_rot: Optional[int] = None
+        self._drag_start_rot: Optional[float] = None
         self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
         self.setZValue(100)
+        self.setCursor(Qt.CursorShape.CrossCursor)
 
-    def _center_scene(self) -> QPointF:
-        b = self._parent_material.boundingRect()
-        return self._parent_material.mapToScene(b.center())
+    @classmethod
+    def _renderer(cls) -> QSvgRenderer:
+        if cls._svg_renderer is None:
+            cls._svg_renderer = QSvgRenderer(_ROTATION_HANDLE_SVG)
+        return cls._svg_renderer
+
+    def _pivot_scene(self) -> QPointF:
+        return self._parent_material.pivot_scene_point()
 
     def _point_to_angle_deg(self, scene_pos: QPointF) -> float:
-        c = self._center_scene()
+        c = self._pivot_scene()
         dx = scene_pos.x() - c.x()
         dy = scene_pos.y() - c.y()
         if dx == 0 and dy == 0:
             return 0.0
         return math.degrees(math.atan2(-dy, dx))
 
+    @staticmethod
+    def _normalize_angle_deg(deg: float) -> float:
+        a = float(deg) % 360.0
+        if a < 0.0:
+            a += 360.0
+        return a
+
     def boundingRect(self) -> QRectF:
-        return QRectF(0, 0, self.HANDLE_SIZE, self.HANDLE_SIZE)
+        s = self.HANDLE_SIZE
+        return QRectF(0, 0, s, s)
 
     def shape(self) -> QPainterPath:
         path = QPainterPath()
@@ -597,43 +766,29 @@ class RotationHandleItem(QGraphicsItem):
         return path
 
     def paint(self, painter: QPainter, option, widget) -> None:
-        path = self._arrow_path()
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(QColor(220, 60, 60), 2))
-        painter.setBrush(QColor(220, 60, 60, 180))
-        painter.drawPath(path)
-
-    def _arrow_path(self) -> QPainterPath:
         s = self.HANDLE_SIZE
-        r = s * 0.35
-        cx, cy = s / 2, s / 2
-        rot = self._corner * 90
-        start_deg = 210 + rot
-        path = QPainterPath()
-        path.moveTo(cx + r * math.cos(math.radians(start_deg)), cy - r * math.sin(math.radians(start_deg)))
-        path.arcTo(2, 2, s - 4, s - 4, start_deg, -240)
-        tip_deg = start_deg - 240
-        tip_x = cx + r * math.cos(math.radians(tip_deg))
-        tip_y = cy - r * math.sin(math.radians(tip_deg))
-        wing = 5
-        path.moveTo(tip_x, tip_y)
-        path.lineTo(tip_x - wing * math.cos(math.radians(tip_deg - 22)), tip_y + wing * math.sin(math.radians(tip_deg - 22)))
-        path.lineTo(tip_x - wing * 0.5 * math.cos(math.radians(tip_deg)), tip_y + wing * 0.5 * math.sin(math.radians(tip_deg)))
-        path.lineTo(tip_x - wing * math.cos(math.radians(tip_deg + 22)), tip_y + wing * math.sin(math.radians(tip_deg + 22)))
-        path.closeSubpath()
-        return path
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.save()
+        painter.translate(s / 2.0, s / 2.0)
+        # 基础弧线向 viewBox 右下（靠近素材）凸起；每角 +180° 使四角均朝内弯向 pivot
+        painter.rotate(float(self._corner * 90 + 180))
+        painter.translate(-s / 2.0, -s / 2.0)
+        self._renderer().render(painter, QRectF(0, 0, s, s))
+        painter.restore()
 
     def _update_pos(self) -> None:
-        b = self._parent_material.boundingRect()
-        o = 4
+        b = self._parent_material.content_bounding_rect()
+        o = 8
+        s = self.HANDLE_SIZE
         if self._corner == 0:
-            self.setPos(b.left() - o - self.HANDLE_SIZE, b.top() - o - self.HANDLE_SIZE)
+            self.setPos(b.left() - o - s, b.top() - o - s)
         elif self._corner == 1:
-            self.setPos(b.right() + o, b.top() - o - self.HANDLE_SIZE)
+            self.setPos(b.right() + o, b.top() - o - s)
         elif self._corner == 2:
             self.setPos(b.right() + o, b.bottom() + o)
         else:
-            self.setPos(b.left() - o - self.HANDLE_SIZE, b.bottom() + o)
+            self.setPos(b.left() - o - s, b.bottom() + o)
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -649,8 +804,8 @@ class RotationHandleItem(QGraphicsItem):
         if self._dragging and self._drag_start_angle is not None and self._drag_start_rot is not None:
             cur = self._point_to_angle_deg(event.scenePos())
             delta = cur - self._drag_start_angle
-            new_rot = (self._drag_start_rot + int(round(delta))) % 360
-            self._parent_material.set_rotation_deg(new_rot)
+            new_rot = self._normalize_angle_deg(self._drag_start_rot + delta)
+            self._parent_material.set_rotation_deg(new_rot, anchor_pivot_in_scene=True)
             if self._parent_material.host:
                 self._parent_material.host._sync_rotation_from_item(self._parent_material)
             event.accept()
@@ -662,6 +817,160 @@ class RotationHandleItem(QGraphicsItem):
             self._dragging = False
             self._drag_start_angle = None
             self._drag_start_rot = None
+            if self._parent_material.host:
+                self._parent_material.host._on_item_interaction_finished(self._parent_material)
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+
+class RotationPivotHandleItem(QGraphicsItem):
+    """可拖动的旋转中心点（十字准星）。"""
+
+    HANDLE_SIZE = 16
+
+    def __init__(self, parent_item: "MaterialItem"):
+        super().__init__(parent_item)
+        self._parent_material = parent_item
+        self._dragging = False
+        self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        self.setZValue(120)
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+
+    def boundingRect(self) -> QRectF:
+        s = self.HANDLE_SIZE
+        return QRectF(0, 0, s, s)
+
+    def shape(self) -> QPainterPath:
+        path = QPainterPath()
+        path.addEllipse(0, 0, self.HANDLE_SIZE, self.HANDLE_SIZE)
+        return path
+
+    def paint(self, painter: QPainter, option, widget) -> None:
+        s = self.HANDLE_SIZE
+        c = s / 2.0
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor(255, 180, 40), 2))
+        painter.setBrush(QColor(255, 210, 80, 200))
+        painter.drawEllipse(QPointF(c, c), 5.5, 5.5)
+        painter.drawLine(QPointF(c, 2), QPointF(c, s - 2))
+        painter.drawLine(QPointF(2, c), QPointF(s - 2, c))
+
+    def _update_pos(self) -> None:
+        m = self._parent_material
+        wx, wy = m.warped_pivot_pixel()
+        disp = m._warped_to_display_local(wx, wy)
+        self.setPos(disp[0] - self.HANDLE_SIZE / 2.0, disp[1] - self.HANDLE_SIZE / 2.0)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            if self._parent_material.host:
+                self._parent_material.host._on_item_interaction_started(self._parent_material)
+                self._parent_material.host._disable_hq_overlay()
+            event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._dragging:
+            m = self._parent_material
+            local = m.mapFromScene(event.scenePos())
+            wx, wy = m._display_local_to_warped(float(local.x()), float(local.y()))
+            sw, sh = m._geom_warped_wh
+            if sw > 0 and sh > 0:
+                m.set_rotation_pivot(wx / sw, wy / sh, keep_image_stable=True)
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            if self._parent_material.host:
+                self._parent_material.host._on_item_interaction_finished(self._parent_material)
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+
+class WarpCornerHandleItem(QGraphicsItem):
+    """角点扭曲控制点，拖拽以改变透视四角。"""
+
+    HANDLE_SIZE = 12
+
+    def __init__(self, parent_item: "MaterialItem", corner: int):
+        super().__init__(parent_item)
+        self._parent_material = parent_item
+        self._corner = corner
+        self._dragging = False
+        self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        self.setZValue(105)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def boundingRect(self) -> QRectF:
+        s = self.HANDLE_SIZE
+        return QRectF(0, 0, s, s)
+
+    def shape(self) -> QPainterPath:
+        path = QPainterPath()
+        s = self.HANDLE_SIZE
+        path.moveTo(s / 2.0, 0)
+        path.lineTo(s, s / 2.0)
+        path.lineTo(s / 2.0, s)
+        path.lineTo(0, s / 2.0)
+        path.closeSubpath()
+        return path
+
+    def paint(self, painter: QPainter, option, widget) -> None:
+        s = self.HANDLE_SIZE
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor(210, 120, 20), 1.5))
+        painter.setBrush(QColor(255, 190, 60, 220))
+        painter.drawPath(self.shape())
+
+    def _update_pos(self) -> None:
+        m = self._parent_material
+        sw, sh = m._geom_scaled_wh
+        cu, cv = m.warp_corners[self._corner]
+        wx = cu * sw
+        wy = cv * sh
+        if m._warp_perspective_M_fwd is not None:
+            wx, wy = perspective_map_point(m._warp_perspective_M_fwd, wx, wy, inverse=False)
+        disp = m._warped_to_display_local(wx, wy)
+        self.setPos(disp[0] - self.HANDLE_SIZE / 2.0, disp[1] - self.HANDLE_SIZE / 2.0)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            if self._parent_material.host:
+                self._parent_material.host._on_item_interaction_started(self._parent_material)
+                self._parent_material.host._disable_hq_overlay()
+            event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._dragging:
+            m = self._parent_material
+            local = m.mapFromScene(event.scenePos())
+            sx, sy = m._display_local_to_scaled(float(local.x()), float(local.y()))
+            sw, sh = m._geom_scaled_wh
+            if sw > 0 and sh > 0:
+                u = max(-0.35, min(1.35, sx / sw))
+                v = max(-0.35, min(1.35, sy / sh))
+                corners = list(m.warp_corners)
+                corners[self._corner] = (u, v)
+                m.set_warp_corners(tuple(corners))
+                if m.host:
+                    m.host._sync_warp_from_item(m)
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
             if self._parent_material.host:
                 self._parent_material.host._on_item_interaction_finished(self._parent_material)
             event.accept()
@@ -715,7 +1024,7 @@ class ScaleHandleItem(QGraphicsItem):
         painter.drawRect(1, 1, s - 2, s - 2)
 
     def _update_pos(self) -> None:
-        b = self._parent_material.boundingRect()
+        b = self._parent_material.content_bounding_rect()
         s = self.HANDLE_SIZE
         o = s / 2.0
         if self._kind == 0:
@@ -737,7 +1046,9 @@ class ScaleHandleItem(QGraphicsItem):
 
     def _scene_to_pre_rot(self, scene_pos: QPointF) -> Tuple[float, float]:
         local = self._parent_material.mapFromScene(scene_pos)
-        return self._parent_material._display_local_to_pre_rot(float(local.x()), float(local.y()))
+        return self._parent_material._display_local_to_scaled(
+            float(local.x()), float(local.y())
+        )
 
     def _anchor_corner_for_kind(self) -> int:
         return (2, 3, 0, 1, 3, 0, 0, 1)[self._kind]
@@ -783,8 +1094,10 @@ class ScaleHandleItem(QGraphicsItem):
             self._dragging = True
             m = self._parent_material
             self._drag_start_sw, self._drag_start_sh = m._scaled_pixel_wh()
-            anchor = m._corner_pre_rot(self._anchor_corner_for_kind(), self._drag_start_sw, self._drag_start_sh)
-            anchor_disp = m._pre_rot_to_display_local(anchor[0], anchor[1])
+            anchor = m._corner_pre_rot(
+                self._anchor_corner_for_kind(), self._drag_start_sw, self._drag_start_sh
+            )
+            anchor_disp = m._scaled_to_display_local(anchor[0], anchor[1])
             self._anchor_scene = m.mapToScene(QPointF(anchor_disp[0], anchor_disp[1]))
             if m.host:
                 m.host._on_item_interaction_started(m)
@@ -797,8 +1110,6 @@ class ScaleHandleItem(QGraphicsItem):
             self._apply_scale_from_pre_rot(px, py)
             m = self._parent_material
             m._update_pix()
-            if m.host:
-                m.host._sync_scale_from_item(m)
             event.accept()
         else:
             super().mouseMoveEvent(event)
@@ -807,6 +1118,9 @@ class ScaleHandleItem(QGraphicsItem):
         if event.button() == Qt.MouseButton.LeftButton:
             self._dragging = False
             self._anchor_scene = None
+            m = self._parent_material
+            if m.host:
+                m.host._sync_scale_from_item(m)
             if self._parent_material.host:
                 self._parent_material.host._on_item_interaction_finished(self._parent_material)
             event.accept()
@@ -836,7 +1150,18 @@ class MaterialItem(QGraphicsPixmapItem):
         self.blend_mode = BlendMode.PASTE
         self.scale_ratio_x = 1.0
         self.scale_ratio_y = 1.0
-        self.rotation_deg = 0
+        self.rotation_deg = 0.0
+        self.rotation_pivot_u = 0.5
+        self.rotation_pivot_v = 0.5
+        self.warp_mode = WarpMode.NONE
+        self.warp_amount = 0
+        self.warp_freq = 6
+        self.warp_corners: Tuple[Tuple[float, float], ...] = DEFAULT_WARP_CORNERS
+        self._warp_perspective_M_fwd: Optional[np.ndarray] = None
+        self._algorithmic_warp_active = False
+        self._geom_scaled_wh: Tuple[int, int] = (1, 1)
+        self._geom_warped_wh: Tuple[int, int] = (1, 1)
+        self._geom_display_wh: Tuple[int, int] = (1, 1)
         self.tint_color_bgr: Tuple[int, int, int] = (0, 0, 0)
         self.tint_alpha = 0.0  # 0~1
         self.mask_offset = 0  # >0 膨胀, <0 腐蚀
@@ -857,22 +1182,37 @@ class MaterialItem(QGraphicsPixmapItem):
         self._scale_handles = [
             ScaleHandleItem(self, i) for i in range(8)
         ]
+        self._pivot_handle = RotationPivotHandleItem(self)
+        self._warp_corner_handles = [
+            WarpCornerHandleItem(self, i) for i in range(4)
+        ]
         hb_i, wb_i = src_bgra.shape[:2]
         sx_i = float(self.scale_ratio_x)
         sy_i = float(self.scale_ratio_y)
-        self._geom_scaled_wh: Tuple[int, int] = (
+        self._geom_scaled_wh = (
             max(1, int(round(wb_i * sx_i))),
             max(1, int(round(hb_i * sy_i))),
         )
+        self._geom_warped_wh = self._geom_scaled_wh
         self._update_pix()
 
     def _update_rotation_handles(self) -> None:
+        visible = self.isSelected()
         for h in self._rotation_handles:
             h._update_pos()
-            h.setVisible(self.isSelected())
+            h.setVisible(visible)
         for h in self._scale_handles:
             h._update_pos()
-            h.setVisible(self.isSelected())
+            h.setVisible(visible)
+        self._pivot_handle._update_pos()
+        self._pivot_handle.setVisible(visible)
+        show_warp = visible and (
+            self.warp_mode == WarpMode.CORNER
+            or not warp_corners_is_default(self.warp_corners)
+        )
+        for h in self._warp_corner_handles:
+            h._update_pos()
+            h.setVisible(show_warp)
 
     def _make_display_qpixmap(self) -> QPixmap:
         img = self._make_transformed_bgra_for_display()
@@ -939,17 +1279,46 @@ class MaterialItem(QGraphicsPixmapItem):
                 interpolation=cv2.INTER_LINEAR,
             )
         self._geom_scaled_wh = (int(img.shape[1]), int(img.shape[0]))
-        if self.rotation_deg % 360 != 0:
-            sw_i, sh_i = self._geom_scaled_wh
-            nw, nh, M = self._rotation_dst_size_and_M(sw_i, sh_i)
+        self._algorithmic_warp_active = False
+        self._warp_perspective_M_fwd = None
+        if (
+            self.warp_mode in (
+                WarpMode.BULGE,
+                WarpMode.PINCH,
+                WarpMode.H_WAVE,
+                WarpMode.V_WAVE,
+                WarpMode.SHEAR,
+            )
+            and self.warp_amount > 0
+        ):
+            img = apply_algorithmic_warp(
+                img, self.warp_mode, self.warp_amount, self.warp_freq
+            )
+            self._algorithmic_warp_active = True
+        need_corner = (
+            self.warp_mode == WarpMode.CORNER
+            or not warp_corners_is_default(self.warp_corners)
+        )
+        if need_corner:
+            img, m_fwd, wh = apply_corner_perspective_warp(img, self.warp_corners)
+            self._warp_perspective_M_fwd = m_fwd
+            self._geom_warped_wh = (int(wh[0]), int(wh[1]))
+        else:
+            self._geom_warped_wh = (int(img.shape[1]), int(img.shape[0]))
+        sw_i, sh_i = self._geom_warped_wh
+        if abs(self.rotation_deg % 360.0) > 1e-3:
+            nw, nh, m = self._rotation_dst_size_and_M(sw_i, sh_i)
+            self._geom_display_wh = (nw, nh)
             img = cv2.warpAffine(
                 img,
-                M,
+                m,
                 (nw, nh),
                 flags=cv2.INTER_LINEAR,
                 borderMode=cv2.BORDER_CONSTANT,
                 borderValue=(0, 0, 0, 0),
             )
+        else:
+            self._geom_display_wh = (sw_i, sh_i)
         return img
 
     def _update_pix(self):
@@ -993,39 +1362,196 @@ class MaterialItem(QGraphicsPixmapItem):
     def _corner_pre_rot(corner: int, sw: float, sh: float) -> Tuple[float, float]:
         return [(0.0, 0.0), (sw, 0.0), (sw, sh), (0.0, sh)][corner]
 
+    def warped_pivot_pixel(self) -> Tuple[float, float]:
+        """返回扭曲后图像坐标系中的旋转中心像素位置。"""
+        sw, sh = self._geom_warped_wh
+        return sw * self.rotation_pivot_u, sh * self.rotation_pivot_v
+
+    def pivot_scene_point(self) -> QPointF:
+        """返回旋转中心在场景中的坐标。"""
+        wx, wy = self.warped_pivot_pixel()
+        lx, ly = self._warped_to_display_local(wx, wy)
+        return self.mapToScene(QPointF(lx, ly))
+
+    def has_active_warp(self) -> bool:
+        """是否启用了会影响坐标反算的扭曲。"""
+        return self._algorithmic_warp_active or self._warp_perspective_M_fwd is not None
+
+    def set_rotation_pivot(
+        self, u: float, v: float, *, keep_image_stable: bool = True
+    ) -> None:
+        """设置旋转中心（扭曲后图像上的归一化坐标）。
+
+        Args:
+            u (float): 水平位置 0~1。
+            v (float): 垂直位置 0~1。
+            keep_image_stable (bool, optional, 默认值 True): True 时保持素材画面在场景中不动，仅移动 pivot。
+        """
+        anchor_scene = (
+            self.mapToScene(self.content_bounding_rect().center())
+            if keep_image_stable
+            else None
+        )
+        self.rotation_pivot_u = max(0.0, min(1.0, u))
+        self.rotation_pivot_v = max(0.0, min(1.0, v))
+        self._update_pix()
+        if anchor_scene is not None:
+            new_anchor = self.mapToScene(self.content_bounding_rect().center())
+            self.setPos(self.pos() + anchor_scene - new_anchor)
+
+    def _keep_pivot_scene_fixed(self, pivot_scene: QPointF) -> None:
+        """调整 scenePos，使旋转中心在场景中的绝对位置保持不变。"""
+        new_pivot = self.pivot_scene_point()
+        self.setPos(self.pos() + pivot_scene - new_pivot)
+
+    def set_warp_mode(self, mode: int) -> None:
+        """设置扭曲模式。"""
+        self.warp_mode = int(mode)
+        self._update_pix()
+
+    def set_warp_amount(self, amount: int) -> None:
+        """设置扭曲强度。"""
+        self.warp_amount = int(max(0, min(100, amount)))
+        self._update_pix()
+
+    def set_warp_freq(self, freq: int) -> None:
+        """设置波浪扭曲频率。"""
+        self.warp_freq = int(max(1, min(20, freq)))
+        self._update_pix()
+
+    def apply_warp_params(self, mode: int, amount: int, freq: int) -> None:
+        """批量设置扭曲参数并刷新一次。
+
+        Args:
+            mode (int): WarpMode 枚举值。
+            amount (int): 扭曲强度 0~100。
+            freq (int): 波纹密度 1~20。
+        """
+        self.warp_mode = int(mode)
+        self.warp_amount = int(max(0, min(100, amount)))
+        self.warp_freq = int(max(1, min(20, freq)))
+        self._update_pix()
+
+    def set_warp_corners(
+        self, corners: Tuple[Tuple[float, float], ...], *, redraw: bool = True
+    ) -> None:
+        """设置透视扭曲四角（缩放后图像上的归一化坐标）。
+
+        Args:
+            corners (Tuple[Tuple[float, float], ...]): 四角 (u,v)。
+            redraw (bool, optional, 默认值 True): 是否立即刷新。
+        """
+        self.warp_corners = tuple(
+            (float(max(-0.35, min(1.35, u))), float(max(-0.35, min(1.35, v))))
+            for u, v in corners
+        )
+        if redraw:
+            self.warp_mode = WarpMode.CORNER
+            self._update_pix()
+
+    def reset_warp_corners(self) -> None:
+        """重置透视四角为默认矩形。"""
+        self.warp_corners = DEFAULT_WARP_CORNERS
+        self._update_pix()
+
+    def _scaled_to_warped_local(self, sx: float, sy: float) -> Tuple[float, float]:
+        if self._warp_perspective_M_fwd is not None:
+            return perspective_map_point(
+                self._warp_perspective_M_fwd, sx, sy, inverse=False
+            )
+        return sx, sy
+
+    def _warped_to_scaled_local(self, wx: float, wy: float) -> Tuple[float, float]:
+        if self._warp_perspective_M_fwd is not None:
+            return perspective_map_point(
+                self._warp_perspective_M_fwd, wx, wy, inverse=True
+            )
+        return wx, wy
+
+    def content_bounding_rect(self) -> QRectF:
+        """返回素材实际内容（非透明旋转外接矩形）在局部坐标中的范围。"""
+        sw, sh = self._geom_warped_wh
+        pts = [
+            self._warped_to_display_local(0.0, 0.0),
+            self._warped_to_display_local(float(sw), 0.0),
+            self._warped_to_display_local(float(sw), float(sh)),
+            self._warped_to_display_local(0.0, float(sh)),
+        ]
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        left, right = min(xs), max(xs)
+        top, bottom = min(ys), max(ys)
+        return QRectF(left, top, right - left, bottom - top)
+
+    def _warped_to_display_local(
+        self, wx: float, wy: float
+    ) -> Tuple[float, float]:
+        if abs(self.rotation_deg % 360.0) <= 1e-3:
+            return wx, wy
+        sw, sh = self._geom_warped_wh
+        _, _, m = self._rotation_dst_size_and_M(sw, sh)
+        lx = float(m[0, 0]) * wx + float(m[0, 1]) * wy + float(m[0, 2])
+        ly = float(m[1, 0]) * wx + float(m[1, 1]) * wy + float(m[1, 2])
+        return lx, ly
+
+    def _display_local_to_warped(
+        self, lx: float, ly: float
+    ) -> Tuple[float, float]:
+        if abs(self.rotation_deg % 360.0) <= 1e-3:
+            return lx, ly
+        sw, sh = self._geom_warped_wh
+        _, _, m = self._rotation_dst_size_and_M(sw, sh)
+        mi = cv2.invertAffineTransform(m)
+        wx = float(mi[0, 0]) * lx + float(mi[0, 1]) * ly + float(mi[0, 2])
+        wy = float(mi[1, 0]) * lx + float(mi[1, 1]) * ly + float(mi[1, 2])
+        return wx, wy
+
+    def _scaled_to_display_local(
+        self, sx: float, sy: float
+    ) -> Tuple[float, float]:
+        wx, wy = self._scaled_to_warped_local(sx, sy)
+        return self._warped_to_display_local(wx, wy)
+
+    def _display_local_to_scaled(
+        self, lx: float, ly: float
+    ) -> Tuple[float, float]:
+        wx, wy = self._display_local_to_warped(lx, ly)
+        return self._warped_to_scaled_local(wx, wy)
+
     def _pre_rot_to_display_local(
         self, px: float, py: float
     ) -> Tuple[float, float]:
-        sw, sh = self._scaled_pixel_wh()
-        if self.rotation_deg % 360 == 0:
-            return px, py
-        _, _, M = self._rotation_dst_size_and_M(sw, sh)
-        lx = float(M[0, 0]) * px + float(M[0, 1]) * py + float(M[0, 2])
-        ly = float(M[1, 0]) * px + float(M[1, 1]) * py + float(M[1, 2])
-        return lx, ly
+        return self._scaled_to_display_local(px, py)
 
     def _display_local_to_pre_rot(
         self, lx: float, ly: float
     ) -> Tuple[float, float]:
-        sw, sh = self._scaled_pixel_wh()
-        if self.rotation_deg % 360 == 0:
-            return lx, ly
-        _, _, M = self._rotation_dst_size_and_M(sw, sh)
-        Mi = cv2.invertAffineTransform(M)
-        px = float(Mi[0, 0]) * lx + float(Mi[0, 1]) * ly + float(Mi[0, 2])
-        py = float(Mi[1, 0]) * lx + float(Mi[1, 1]) * ly + float(Mi[1, 2])
-        return px, py
+        return self._display_local_to_scaled(lx, ly)
 
     def _keep_corner_scene_fixed(self, corner: int, scene_pt: QPointF) -> None:
         sw, sh = self._scaled_pixel_wh()
         ax, ay = self._corner_pre_rot(corner, float(sw), float(sh))
-        disp = self._pre_rot_to_display_local(ax, ay)
+        disp = self._scaled_to_display_local(ax, ay)
         cur = self.mapToScene(QPointF(disp[0], disp[1]))
         self.setPos(self.pos() + scene_pt - cur)
 
-    def set_rotation_deg(self, deg: int):
-        self.rotation_deg = deg % 360
+    def set_rotation_deg(
+        self, deg: float, *, anchor_pivot_in_scene: bool = False
+    ) -> None:
+        """设置旋转角度（度）。
+
+        Args:
+            deg (float): 角度 0~360。
+            anchor_pivot_in_scene (bool, optional, 默认值 False): True 时保持 pivot 在场景中位置不变。
+        """
+        pivot_scene = self.pivot_scene_point() if anchor_pivot_in_scene else None
+        a = float(deg) % 360.0
+        if a < 0.0:
+            a += 360.0
+        self.rotation_deg = a
         self._update_pix()
+        if pivot_scene is not None:
+            self._keep_pivot_scene_fixed(pivot_scene)
 
     def set_tint(self, color: Tuple[int, int, int], alpha: float):
         self.tint_color_bgr = color
@@ -1072,22 +1598,28 @@ class MaterialItem(QGraphicsPixmapItem):
         self.set_layer_mask_from_gray(self.base_bgra[:, :, 3].copy())
 
     def _rotation_dst_size_and_M(self, ws: int, hs: int) -> Tuple[int, int, np.ndarray]:
-        """输入缩放后图像宽高（列数、行数），返回 warpAffine 输出宽高与仿射矩阵 M。
+        """输入扭曲后图像宽高，返回固定尺寸旋转画布与仿射矩阵 M。
 
         Note:
-            cv2.warpAffine 所用 M 将缩放后的 **源图坐标** 映射到旋转后的 **目标图坐标**；
-            着色时对每个目标像素使用 invertAffineTransform(M) 得到源上的采样坐标。
+            输出画布边长固定为 pivot 到四角最远距离的 2 倍（向上取整），
+            pivot 始终落在画布中心，避免旋转时 pixmap 尺寸逐帧变化引起抖动。
         """
         w_f, h_f = float(ws), float(hs)
-        M = cv2.getRotationMatrix2D((w_f / 2.0, h_f / 2.0), float(self.rotation_deg), 1.0)
-        cos_r = abs(float(M[0, 0]))
-        sin_r = abs(float(M[0, 1]))
-        nw = int((h_f * sin_r) + (w_f * cos_r))
-        nh = int((h_f * cos_r) + (w_f * sin_r))
-        M = M.copy()
-        M[0, 2] += (nw / 2.0) - w_f / 2.0
-        M[1, 2] += (nh / 2.0) - h_f / 2.0
-        return nw, nh, M
+        px = w_f * self.rotation_pivot_u
+        py = h_f * self.rotation_pivot_v
+        max_r = max(
+            math.hypot(px, py),
+            math.hypot(w_f - px, py),
+            math.hypot(w_f - px, h_f - py),
+            math.hypot(px, h_f - py),
+        )
+        side = max(1, int(math.ceil(2.0 * max_r)))
+        cx, cy = side / 2.0, side / 2.0
+        m = cv2.getRotationMatrix2D((px, py), float(self.rotation_deg), 1.0)
+        m = m.copy()
+        m[0, 2] += cx - px
+        m[1, 2] += cy - py
+        return side, side, m
 
     def map_display_local_to_base_xy(
         self, lx: float, ly: float
@@ -1104,18 +1636,16 @@ class MaterialItem(QGraphicsPixmapItem):
         sr_x = float(self.scale_ratio_x)
         sr_y = float(self.scale_ratio_y)
         hb, wb = self.base_bgra.shape[:2]
-        sw, sh = self._geom_scaled_wh
-        if self.rotation_deg % 360 == 0:
-            if lx < -1e-6 or ly < -1e-6 or lx > sw - 1e-6 or ly > sh - 1e-6:
-                return None
-            sx, sy = lx, ly
-        else:
-            nw, nh, M = self._rotation_dst_size_and_M(sw, sh)
-            if lx < -1e-6 or ly < -1e-6 or lx > nw - 1e-6 or ly > nh - 1e-6:
-                return None
-            Mi = cv2.invertAffineTransform(M)
-            sx = float(Mi[0, 0]) * lx + float(Mi[0, 1]) * ly + float(Mi[0, 2])
-            sy = float(Mi[1, 0]) * lx + float(Mi[1, 1]) * ly + float(Mi[1, 2])
+        sw, sh = self._geom_warped_wh
+        dw, dh = self._geom_display_wh
+        if self.has_active_warp():
+            return None
+        if lx < -1e-6 or ly < -1e-6 or lx > dw - 1e-6 or ly > dh - 1e-6:
+            return None
+        wx, wy = self._display_local_to_warped(lx, ly)
+        if wx < -1e-3 or wy < -1e-3 or wx > sw - 1 + 1e-3 or wy > sh - 1 + 1e-3:
+            return None
+        sx, sy = self._warped_to_scaled_local(wx, wy)
         bx = sx / sr_x
         by = sy / sr_y
         if bx < -1e-3 or by < -1e-3 or bx > wb - 1 + 1e-3 or by > hb - 1 + 1e-3:
@@ -1136,20 +1666,23 @@ class MaterialItem(QGraphicsPixmapItem):
         """
         sr_x = float(self.scale_ratio_x)
         sr_y = float(self.scale_ratio_y)
-        sw, sh = self._geom_scaled_wh
+        sw0, sh0 = self._geom_scaled_wh
         hb, wb = self.base_bgra.shape[:2]
         if bx < -1e-3 or by < -1e-3 or bx > wb - 1 + 1e-3 or by > hb - 1 + 1e-3:
             return None
+        if self.has_active_warp():
+            return None
         sx = bx * sr_x
         sy = by * sr_y
-        if sx < -1e-3 or sy < -1e-3 or sx > sw - 1 + 1e-3 or sy > sh - 1 + 1e-3:
+        if sx < -1e-3 or sy < -1e-3 or sx > sw0 - 1 + 1e-3 or sy > sh0 - 1 + 1e-3:
             return None
-        if self.rotation_deg % 360 == 0:
-            return sx, sy
-        nw, nh, M = self._rotation_dst_size_and_M(sw, sh)
-        lx = float(M[0, 0]) * sx + float(M[0, 1]) * sy + float(M[0, 2])
-        ly = float(M[1, 0]) * sx + float(M[1, 1]) * sy + float(M[1, 2])
-        if lx < -1e-3 or ly < -1e-3 or lx > nw - 1 + 1e-3 or ly > nh - 1 + 1e-3:
+        wx, wy = self._scaled_to_warped_local(sx, sy)
+        sw, sh = self._geom_warped_wh
+        if wx < -1e-3 or wy < -1e-3 or wx > sw - 1 + 1e-3 or wy > sh - 1 + 1e-3:
+            return None
+        lx, ly = self._warped_to_display_local(wx, wy)
+        dw, dh = self._geom_display_wh
+        if lx < -1e-3 or ly < -1e-3 or lx > dw - 1 + 1e-3 or ly > dh - 1 + 1e-3:
             return None
         return lx, ly
 
@@ -1274,7 +1807,13 @@ class MaterialItem(QGraphicsPixmapItem):
             "scale_x": float(self.scale_ratio_x),
             "scale_y": float(self.scale_ratio_y),
             "scale": float(self.scale_ratio_x),
-            "rotation": int(self.rotation_deg),
+            "rotation": float(self.rotation_deg),
+            "rotation_pivot_u": float(self.rotation_pivot_u),
+            "rotation_pivot_v": float(self.rotation_pivot_v),
+            "warp_mode": int(self.warp_mode),
+            "warp_amount": int(self.warp_amount),
+            "warp_freq": int(self.warp_freq),
+            "warp_corners": [tuple(c) for c in self.warp_corners],
             "tint_color_bgr": tuple(self.tint_color_bgr),
             "tint_alpha": float(self.tint_alpha),
             "mode": int(self.blend_mode),
@@ -1318,6 +1857,15 @@ class MaterialItem(QGraphicsPixmapItem):
             for h in self._scale_handles:
                 h._update_pos()
                 h.setVisible(visible)
+            self._pivot_handle._update_pos()
+            self._pivot_handle.setVisible(visible)
+            show_warp = visible and (
+                self.warp_mode == WarpMode.CORNER
+                or not warp_corners_is_default(self.warp_corners)
+            )
+            for h in self._warp_corner_handles:
+                h._update_pos()
+                h.setVisible(show_warp)
         elif change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
             self._update_rotation_handles()
         return super().itemChange(change, value)
@@ -1693,6 +2241,54 @@ class MainWindow(QMainWindow):
         form_tf.addRow("缩放X(%)", scale_row)
         form_tf.addRow("缩放Y(%)", scale_y_row)
         form_tf.addRow("", self.chk_lock_aspect)
+        self.cmb_warp = QComboBox()
+        self.cmb_warp.addItems(
+            [
+                "无",
+                "隆起",
+                "内凹",
+                "水平波纹",
+                "垂直波纹",
+                "斜切",
+                "角点扭曲",
+            ]
+        )
+        self.sld_warp_amount = QSlider(Qt.Orientation.Horizontal)
+        self.sld_warp_amount.setRange(0, 100)
+        self.sld_warp_amount.setValue(0)
+        self.spn_warp_amount = QSpinBox()
+        self.spn_warp_amount.setRange(0, 100)
+        self.spn_warp_amount.setValue(0)
+        self.sld_warp_freq = QSlider(Qt.Orientation.Horizontal)
+        self.sld_warp_freq.setRange(1, 20)
+        self.sld_warp_freq.setValue(6)
+        self.spn_warp_freq = QSpinBox()
+        self.spn_warp_freq.setRange(1, 20)
+        self.spn_warp_freq.setValue(6)
+        warp_amount_row = QWidget()
+        wal = QHBoxLayout(warp_amount_row)
+        wal.setContentsMargins(0, 0, 0, 0)
+        wal.addWidget(self.sld_warp_amount, 1)
+        wal.addWidget(self.spn_warp_amount)
+        warp_freq_row = QWidget()
+        wfl = QHBoxLayout(warp_freq_row)
+        wfl.setContentsMargins(0, 0, 0, 0)
+        wfl.addWidget(self.sld_warp_freq, 1)
+        wfl.addWidget(self.spn_warp_freq)
+        self.btn_warp_random = QPushButton("随机幻变")
+        self.btn_warp_random.setToolTip(
+            "随机组合扭曲模式、强度与角点偏移，让素材形态更自然多样。"
+        )
+        self.btn_warp_reset = QPushButton("重置扭曲")
+        warp_btn_row = QWidget()
+        wbl = QHBoxLayout(warp_btn_row)
+        wbl.setContentsMargins(0, 0, 0, 0)
+        wbl.addWidget(self.btn_warp_random)
+        wbl.addWidget(self.btn_warp_reset)
+        form_tf.addRow("扭曲模式", self.cmb_warp)
+        form_tf.addRow("扭曲强度", warp_amount_row)
+        form_tf.addRow("波纹密度", warp_freq_row)
+        form_tf.addRow("", warp_btn_row)
         form_tf.addRow("颜色叠加", tint_row)
         form_tf.addRow("颜色透明度(%)", alpha_row)
         form_tf.addRow("掩码腐蚀/膨胀(px)", mask_row)
@@ -1980,6 +2576,17 @@ class MainWindow(QMainWindow):
         self.sld_gaussian.valueChanged.connect(self._apply_props_to_item)
         self.chk_seam_repair.toggled.connect(self._apply_props_to_item)
         self.chk_harmonize.toggled.connect(self._apply_props_to_item)
+        self.cmb_warp.currentIndexChanged.connect(self._apply_props_to_item)
+        self.sld_warp_amount.valueChanged.connect(self.spn_warp_amount.setValue)
+        self.spn_warp_amount.valueChanged.connect(self.sld_warp_amount.setValue)
+        self.sld_warp_freq.valueChanged.connect(self.spn_warp_freq.setValue)
+        self.spn_warp_freq.valueChanged.connect(self.sld_warp_freq.setValue)
+        self.sld_warp_amount.valueChanged.connect(self._apply_props_to_item)
+        self.spn_warp_amount.valueChanged.connect(self._apply_props_to_item)
+        self.sld_warp_freq.valueChanged.connect(self._apply_props_to_item)
+        self.spn_warp_freq.valueChanged.connect(self._apply_props_to_item)
+        self.btn_warp_random.clicked.connect(self._on_warp_random)
+        self.btn_warp_reset.clicked.connect(self._on_warp_reset)
         self.cmb_harmonize_backend.currentIndexChanged.connect(
             self._on_harmonize_backend_changed,
         )
@@ -2184,12 +2791,17 @@ class MainWindow(QMainWindow):
                 self.chk_layer_mask_paint.setChecked(False)
                 return
             m.ensure_layer_mask_editable()
+            if m.has_active_warp():
+                QMessageBox.information(
+                    self,
+                    "提示",
+                    "已启用扭曲时暂不支持蒙版画笔，请先点击「重置扭曲」。",
+                )
+                self.chk_layer_mask_paint.setChecked(False)
+                return
             self._populate_props_from_item(m)
             self._mask_paint_target = m
-            m.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
-            for h in m._rotation_handles:
-                h.setVisible(False)
-                h.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self._set_material_handles_for_mask_paint(m, False)
             self.view.setDragMode(QGraphicsView.DragMode.NoDrag)
             self.view.setCursor(Qt.CursorShape.CrossCursor)
             self.statusBar().showMessage(
@@ -2224,15 +2836,40 @@ class MainWindow(QMainWindow):
         self._schedule_hq_preview()
         self._schedule_history_snapshot()
 
+    def _set_material_handles_for_mask_paint(
+        self, m: MaterialItem, enabled: bool
+    ) -> None:
+        """蒙版画笔模式下隐藏/恢复素材变换手柄。"""
+        m.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, enabled)
+        btn = (
+            Qt.MouseButton.LeftButton
+            if enabled
+            else Qt.MouseButton.NoButton
+        )
+        for h in m._rotation_handles:
+            h.setAcceptedMouseButtons(btn)
+        for h in m._scale_handles:
+            h.setAcceptedMouseButtons(btn)
+        for h in m._warp_corner_handles:
+            h.setAcceptedMouseButtons(btn)
+        m._pivot_handle.setAcceptedMouseButtons(btn)
+        if enabled:
+            m._update_rotation_handles()
+        else:
+            for h in m._rotation_handles:
+                h.setVisible(False)
+            for h in m._scale_handles:
+                h.setVisible(False)
+            for h in m._warp_corner_handles:
+                h.setVisible(False)
+            m._pivot_handle.setVisible(False)
+
     def _mask_paint_restore_interaction(self) -> None:
-        """恢复素材拖动与旋转手柄。"""
+        """恢复素材拖动与变换手柄。"""
         if self._mask_paint_target is None:
             return
         m = self._mask_paint_target
-        m.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
-        for h in m._rotation_handles:
-            h.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
-            h.setVisible(m.isSelected())
+        self._set_material_handles_for_mask_paint(m, True)
         self._mask_paint_target = None
 
     def _refresh_layer_mask_paint_controls_enabled(self) -> None:
@@ -2615,7 +3252,7 @@ class MainWindow(QMainWindow):
 
             # 设置属性
             m_item.set_scale_ratio(scale)
-            m_item.set_rotation_deg(int(rot) % 360)
+            m_item.set_rotation_deg(float(rot) % 360.0)
             blend_mode = choose_blend_mode()
             m_item.set_blend_mode(blend_mode)
 
@@ -2905,12 +3542,16 @@ class MainWindow(QMainWindow):
                 self.sld_hue.setValue(0)
                 self.sld_sat.setValue(100)
                 self.sld_gaussian.setValue(0)
+                self.cmb_warp.setCurrentIndex(WarpMode.NONE)
+                self.sld_warp_amount.setValue(0)
+                self.sld_warp_freq.setValue(6)
                 self._set_tint_button_color(None)
                 self.lbl_layer_mask_status.setText("图层蒙版: —")
                 self.chk_layer_mask_paint.setEnabled(False)
                 return
             self.cmb_mode.setCurrentIndex(m.blend_mode)
-            self.sld_rot.setValue(m.rotation_deg)
+            self.sld_rot.setValue(int(round(m.rotation_deg)) % 360)
+            self.spn_rot.setValue(int(round(m.rotation_deg)) % 360)
             self.sld_scale.setValue(int(round(m.scale_ratio_x * 100)))
             self.sld_scale_y.setValue(int(round(m.scale_ratio_y * 100)))
             locked = abs(m.scale_ratio_x - m.scale_ratio_y) < 1e-4
@@ -2927,6 +3568,9 @@ class MainWindow(QMainWindow):
             self.sld_gaussian.setValue(int(m.gaussian_blur_radius))
             self.chk_seam_repair.setChecked(m.seam_repair)
             self.chk_harmonize.setChecked(m.harmonize)
+            self.cmb_warp.setCurrentIndex(m.warp_mode)
+            self.sld_warp_amount.setValue(m.warp_amount)
+            self.sld_warp_freq.setValue(m.warp_freq)
             self._set_tint_button_color(m.tint_color_bgr if m.tint_alpha > 0 else None)
             self.lbl_layer_mask_status.setText(
                 "图层蒙版: 已启用" if m.layer_mask_u8 is not None else "图层蒙版: 无"
@@ -2943,7 +3587,7 @@ class MainWindow(QMainWindow):
         if m is None:
             return
         m.set_blend_mode(self.cmb_mode.currentIndex())
-        m.set_rotation_deg(self.sld_rot.value())
+        m.set_rotation_deg(float(self.sld_rot.value()), anchor_pivot_in_scene=True)
         m.set_scale_ratios(
             self.sld_scale.value() / 100.0,
             self.sld_scale_y.value() / 100.0,
@@ -2962,6 +3606,11 @@ class MainWindow(QMainWindow):
         m.set_hue_shift(self.sld_hue.value())
         m.set_saturation(self.sld_sat.value())
         m.set_gaussian_blur_radius(self.sld_gaussian.value())
+        m.apply_warp_params(
+            self.cmb_warp.currentIndex(),
+            self.sld_warp_amount.value(),
+            self.sld_warp_freq.value(),
+        )
         m.seam_repair = self.chk_seam_repair.isChecked()
         m.harmonize = self.chk_harmonize.isChecked()
 
@@ -3682,7 +4331,7 @@ class MainWindow(QMainWindow):
                 float(sd.get("scale_x", sd.get("scale", 1.0))),
                 float(sd.get("scale_y", sd.get("scale", 1.0))),
             )
-            m.set_rotation_deg(int(sd.get("rotation", 0)))
+            m.set_rotation_deg(float(sd.get("rotation", 0)))
             color = tuple(sd.get("tint_color_bgr", (0, 0, 0)))
             alpha = float(sd.get("tint_alpha", 0.0))
             m.set_tint(color, alpha)
@@ -3697,6 +4346,16 @@ class MainWindow(QMainWindow):
             m.set_gaussian_blur_radius(int(sd.get("gaussian_blur_radius", 0)))
             m.seam_repair = bool(sd.get("seam_repair", False))
             m.harmonize = bool(sd.get("harmonize", False))
+            m.rotation_pivot_u = float(sd.get("rotation_pivot_u", 0.5))
+            m.rotation_pivot_v = float(sd.get("rotation_pivot_v", 0.5))
+            m.warp_mode = int(sd.get("warp_mode", WarpMode.NONE))
+            m.warp_amount = int(sd.get("warp_amount", 0))
+            m.warp_freq = int(sd.get("warp_freq", 6))
+            wc_raw = sd.get("warp_corners")
+            if isinstance(wc_raw, list) and len(wc_raw) == 4:
+                m.warp_corners = tuple(
+                    (float(p[0]), float(p[1])) for p in wc_raw
+                )
             lmb = sd.get("layer_mask_png_bytes")
             if isinstance(lmb, (bytes, bytearray)) and len(lmb) > 0:
                 lm = cv2.imdecode(np.frombuffer(lmb, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
@@ -3704,6 +4363,7 @@ class MainWindow(QMainWindow):
                     if lm.ndim == 3:
                         lm = cv2.cvtColor(lm, cv2.COLOR_BGR2GRAY)
                     m.set_layer_mask_from_gray(lm)
+            m._update_pix()
             self.material_items.append(m)
         self._rebuild_right_list()
         self._disable_hq_overlay()
@@ -3753,8 +4413,8 @@ class MainWindow(QMainWindow):
             return
         self._suppress_ui = True
         try:
-            self.sld_rot.setValue(m.rotation_deg)
-            self.spn_rot.setValue(m.rotation_deg)
+            self.sld_rot.setValue(int(round(m.rotation_deg)) % 360)
+            self.spn_rot.setValue(int(round(m.rotation_deg)) % 360)
         finally:
             self._suppress_ui = False
 
@@ -3798,6 +4458,65 @@ class MainWindow(QMainWindow):
                 self._suppress_ui = False
         self._apply_props_to_item()
 
+    def _sync_warp_from_item(self, m: MaterialItem) -> None:
+        """从画布角点扭曲手柄拖拽时同步到属性面板。"""
+        if m != self._current_item():
+            return
+        self._suppress_ui = True
+        try:
+            self.cmb_warp.setCurrentIndex(m.warp_mode)
+            self.sld_warp_amount.setValue(m.warp_amount)
+            self.spn_warp_amount.setValue(m.warp_amount)
+        finally:
+            self._suppress_ui = False
+
+    def _on_warp_random(self) -> None:
+        """为当前素材随机施加扭曲，增加形态多样性。"""
+        m = self._current_item()
+        if m is None:
+            QMessageBox.information(self, "提示", "请先选中一个素材。")
+            return
+        mode = random.choice(
+            [
+                WarpMode.BULGE,
+                WarpMode.PINCH,
+                WarpMode.H_WAVE,
+                WarpMode.V_WAVE,
+                WarpMode.SHEAR,
+                WarpMode.CORNER,
+            ]
+        )
+        amount = random.randint(18, 72)
+        freq = random.randint(3, 14)
+        m.apply_warp_params(mode, amount, freq)
+        if mode == WarpMode.CORNER:
+            jitter = 0.12 * (amount / 100.0)
+            corners = []
+            for u, v in DEFAULT_WARP_CORNERS:
+                corners.append(
+                    (
+                        u + random.uniform(-jitter, jitter),
+                        v + random.uniform(-jitter, jitter),
+                    )
+                )
+            m.set_warp_corners(tuple(corners))
+        self._populate_props_from_item(m)
+        self._disable_hq_overlay()
+        self._schedule_hq_preview()
+        self._schedule_history_snapshot()
+
+    def _on_warp_reset(self) -> None:
+        """重置当前素材的全部扭曲参数。"""
+        m = self._current_item()
+        if m is None:
+            return
+        m.warp_corners = DEFAULT_WARP_CORNERS
+        m.apply_warp_params(WarpMode.NONE, 0, 6)
+        self._populate_props_from_item(m)
+        self._disable_hq_overlay()
+        self._schedule_hq_preview()
+        self._schedule_history_snapshot()
+
 
 def print_basic_usage():
     """启动时在终端输出一次基本操作说明。"""
@@ -3810,7 +4529,7 @@ def print_basic_usage():
 界面说明：
   左侧：素材列表（双击素材加入画布）
   中间：画布预览（滚轮缩放，按住左键拖动画布，点击/拖动素材）
-  右上：已添加素材 + 属性（旋转、缩放X/Y、自由变换手柄、颜色叠加、图层蒙版、全局掩码腐蚀/膨胀、混合模式）
+  右上：已添加素材 + 属性（旋转、缩放X/Y、扭曲、自由变换手柄、颜色叠加、图层蒙版、混合模式）
   右下：背景列表 + 背景取色器 / 一键提取背景主色
 
 工具栏常用按钮：
@@ -3828,8 +4547,9 @@ def print_basic_usage():
 提示：
   - 泊松融合 Normal / Mix 模式建议配合“高质量预览”使用。
   - 颜色叠加可配合“强叠加模式”和透明度滑条调节效果。
-  - 选中素材后拖拽四角/四边蓝色方块可自由变换（非均匀缩放）；取消「锁定宽高比」后可分别调节 X/Y。
-  - 拖拽四角外侧红色弧形箭头可旋转素材。
+  - 扭曲：隆起/内凹/波纹/斜切/角点透视，可点「随机幻变」快速打破素材形态单一性。
+  - 选中素材后拖拽四角/四边蓝色方块可自由变换；拖拽黄色十字为旋转中心；拖拽橙色菱形为角点扭曲。
+  - 拖拽四角外侧 SVG 圆环箭头可旋转素材。
   - 图层蒙版：文件加载 / 从 Alpha 生成 / 画布画笔编辑（橡皮与恢复） / 清除；画笔半径按素材原始像素计。
 ============================================
 """.strip()
