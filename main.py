@@ -669,6 +669,151 @@ class RotationHandleItem(QGraphicsItem):
             super().mouseReleaseEvent(event)
 
 
+class ScaleHandleItem(QGraphicsItem):
+    """选中素材边/角处的控制点，拖拽以锚点为基准进行自由缩放（可非均匀）。"""
+
+    HANDLE_SIZE = 10
+
+    def __init__(self, parent_item: "MaterialItem", kind: int):
+        super().__init__(parent_item)
+        self._parent_material = parent_item
+        self._kind = kind  # 0=TL,1=TR,2=BR,3=BL; 4=T,5=R,6=B,7=L
+        self._dragging = False
+        self._anchor_scene: Optional[QPointF] = None
+        self._drag_start_sw = 0
+        self._drag_start_sh = 0
+        self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        self.setZValue(110)
+        cursors = (
+            Qt.CursorShape.SizeFDiagCursor,
+            Qt.CursorShape.SizeBDiagCursor,
+            Qt.CursorShape.SizeFDiagCursor,
+            Qt.CursorShape.SizeBDiagCursor,
+            Qt.CursorShape.SizeVerCursor,
+            Qt.CursorShape.SizeHorCursor,
+            Qt.CursorShape.SizeVerCursor,
+            Qt.CursorShape.SizeHorCursor,
+        )
+        self.setCursor(cursors[kind])
+
+    def boundingRect(self) -> QRectF:
+        s = self.HANDLE_SIZE
+        return QRectF(0, 0, s, s)
+
+    def shape(self) -> QPainterPath:
+        path = QPainterPath()
+        path.addRect(0, 0, self.HANDLE_SIZE, self.HANDLE_SIZE)
+        return path
+
+    def paint(self, painter: QPainter, option, widget) -> None:
+        s = self.HANDLE_SIZE
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor(40, 120, 220), 1.5))
+        painter.setBrush(QColor(80, 160, 255, 210))
+        painter.drawRect(1, 1, s - 2, s - 2)
+
+    def _update_pos(self) -> None:
+        b = self._parent_material.boundingRect()
+        s = self.HANDLE_SIZE
+        o = s / 2.0
+        if self._kind == 0:
+            self.setPos(b.left() - o, b.top() - o)
+        elif self._kind == 1:
+            self.setPos(b.right() - o, b.top() - o)
+        elif self._kind == 2:
+            self.setPos(b.right() - o, b.bottom() - o)
+        elif self._kind == 3:
+            self.setPos(b.left() - o, b.bottom() - o)
+        elif self._kind == 4:
+            self.setPos(b.center().x() - o, b.top() - o)
+        elif self._kind == 5:
+            self.setPos(b.right() - o, b.center().y() - o)
+        elif self._kind == 6:
+            self.setPos(b.center().x() - o, b.bottom() - o)
+        else:
+            self.setPos(b.left() - o, b.center().y() - o)
+
+    def _scene_to_pre_rot(self, scene_pos: QPointF) -> Tuple[float, float]:
+        local = self._parent_material.mapFromScene(scene_pos)
+        return self._parent_material._display_local_to_pre_rot(float(local.x()), float(local.y()))
+
+    def _anchor_corner_for_kind(self) -> int:
+        return (2, 3, 0, 1, 3, 0, 0, 1)[self._kind]
+
+    def _apply_scale_from_pre_rot(self, px: float, py: float) -> None:
+        m = self._parent_material
+        hb, wb = m.base_bgra.shape[:2]
+        min_sw = max(1.0, wb * 0.05)
+        min_sh = max(1.0, hb * 0.05)
+        sw0 = float(self._drag_start_sw)
+        sh0 = float(self._drag_start_sh)
+        kind = self._kind
+        if kind == 2:
+            new_sw = max(min_sw, px)
+            new_sh = max(min_sh, py)
+        elif kind == 0:
+            new_sw = max(min_sw, sw0 - px)
+            new_sh = max(min_sh, sh0 - py)
+        elif kind == 1:
+            new_sw = max(min_sw, px)
+            new_sh = max(min_sh, sh0 - py)
+        elif kind == 3:
+            new_sw = max(min_sw, sw0 - px)
+            new_sh = max(min_sh, py)
+        elif kind == 4:
+            new_sw = sw0
+            new_sh = max(min_sh, sh0 - py)
+        elif kind == 5:
+            new_sw = max(min_sw, px)
+            new_sh = sh0
+        elif kind == 6:
+            new_sw = sw0
+            new_sh = max(min_sh, py)
+        else:
+            new_sw = max(min_sw, sw0 - px)
+            new_sh = sh0
+        m.set_scale_ratios(new_sw / wb, new_sh / hb, redraw=False)
+        if self._anchor_scene is not None:
+            m._keep_corner_scene_fixed(self._anchor_corner_for_kind(), self._anchor_scene)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            m = self._parent_material
+            self._drag_start_sw, self._drag_start_sh = m._scaled_pixel_wh()
+            anchor = m._corner_pre_rot(self._anchor_corner_for_kind(), self._drag_start_sw, self._drag_start_sh)
+            anchor_disp = m._pre_rot_to_display_local(anchor[0], anchor[1])
+            self._anchor_scene = m.mapToScene(QPointF(anchor_disp[0], anchor_disp[1]))
+            if m.host:
+                m.host._on_item_interaction_started(m)
+                m.host._disable_hq_overlay()
+            event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._dragging:
+            px, py = self._scene_to_pre_rot(event.scenePos())
+            self._apply_scale_from_pre_rot(px, py)
+            m = self._parent_material
+            m._update_pix()
+            if m.host:
+                m.host._sync_scale_from_item(m)
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            self._anchor_scene = None
+            if self._parent_material.host:
+                self._parent_material.host._on_item_interaction_finished(self._parent_material)
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+
 class MaterialItem(QGraphicsPixmapItem):
     def __init__(
         self,
@@ -689,7 +834,8 @@ class MaterialItem(QGraphicsPixmapItem):
         self.base_bgra = src_bgra  # original BGRA
         self.memory_png_bytes = memory_png_bytes  # 用于撤销/重做内存素材；否则 None
         self.blend_mode = BlendMode.PASTE
-        self.scale_ratio = 1.0
+        self.scale_ratio_x = 1.0
+        self.scale_ratio_y = 1.0
         self.rotation_deg = 0
         self.tint_color_bgr: Tuple[int, int, int] = (0, 0, 0)
         self.tint_alpha = 0.0  # 0~1
@@ -708,16 +854,23 @@ class MaterialItem(QGraphicsPixmapItem):
         self._rotation_handles = [
             RotationHandleItem(self, i) for i in range(4)
         ]
+        self._scale_handles = [
+            ScaleHandleItem(self, i) for i in range(8)
+        ]
         hb_i, wb_i = src_bgra.shape[:2]
-        sr_i = float(self.scale_ratio)
+        sx_i = float(self.scale_ratio_x)
+        sy_i = float(self.scale_ratio_y)
         self._geom_scaled_wh: Tuple[int, int] = (
-            max(1, int(round(wb_i * sr_i))),
-            max(1, int(round(hb_i * sr_i))),
+            max(1, int(round(wb_i * sx_i))),
+            max(1, int(round(hb_i * sy_i))),
         )
         self._update_pix()
 
     def _update_rotation_handles(self) -> None:
         for h in self._rotation_handles:
+            h._update_pos()
+            h.setVisible(self.isSelected())
+        for h in self._scale_handles:
             h._update_pos()
             h.setVisible(self.isSelected())
 
@@ -777,12 +930,12 @@ class MaterialItem(QGraphicsPixmapItem):
         if self.gaussian_blur_radius > 0:
             ksize = self.gaussian_blur_radius * 2 + 1
             img[:, :, :3] = cv2.GaussianBlur(img[:, :, :3], (ksize, ksize), 0)
-        if self.scale_ratio != 1.0:
+        if self.scale_ratio_x != 1.0 or self.scale_ratio_y != 1.0:
             img = cv2.resize(
                 img,
                 (0, 0),
-                fx=self.scale_ratio,
-                fy=self.scale_ratio,
+                fx=self.scale_ratio_x,
+                fy=self.scale_ratio_y,
                 interpolation=cv2.INTER_LINEAR,
             )
         self._geom_scaled_wh = (int(img.shape[1]), int(img.shape[0]))
@@ -809,8 +962,66 @@ class MaterialItem(QGraphicsPixmapItem):
         self.blend_mode = mode
 
     def set_scale_ratio(self, r: float):
-        self.scale_ratio = max(0.05, min(8.0, r))
+        r = max(0.05, min(8.0, r))
+        self.scale_ratio_x = r
+        self.scale_ratio_y = r
         self._update_pix()
+
+    def set_scale_ratios(
+        self, sx: float, sy: float, *, redraw: bool = True
+    ) -> None:
+        """设置水平/垂直缩放比（可非均匀）。
+
+        Args:
+            sx (float): 水平缩放比，范围约 0.05~8.0。
+            sy (float): 垂直缩放比，范围约 0.05~8.0。
+            redraw (bool, optional, 默认值 True): False 时暂不刷新 pixmap，便于连续拖拽末尾统一刷新。
+        """
+        self.scale_ratio_x = max(0.05, min(8.0, sx))
+        self.scale_ratio_y = max(0.05, min(8.0, sy))
+        if redraw:
+            self._update_pix()
+
+    def _scaled_pixel_wh(self) -> Tuple[int, int]:
+        hb, wb = self.base_bgra.shape[:2]
+        return (
+            max(1, int(round(wb * float(self.scale_ratio_x)))),
+            max(1, int(round(hb * float(self.scale_ratio_y)))),
+        )
+
+    @staticmethod
+    def _corner_pre_rot(corner: int, sw: float, sh: float) -> Tuple[float, float]:
+        return [(0.0, 0.0), (sw, 0.0), (sw, sh), (0.0, sh)][corner]
+
+    def _pre_rot_to_display_local(
+        self, px: float, py: float
+    ) -> Tuple[float, float]:
+        sw, sh = self._scaled_pixel_wh()
+        if self.rotation_deg % 360 == 0:
+            return px, py
+        _, _, M = self._rotation_dst_size_and_M(sw, sh)
+        lx = float(M[0, 0]) * px + float(M[0, 1]) * py + float(M[0, 2])
+        ly = float(M[1, 0]) * px + float(M[1, 1]) * py + float(M[1, 2])
+        return lx, ly
+
+    def _display_local_to_pre_rot(
+        self, lx: float, ly: float
+    ) -> Tuple[float, float]:
+        sw, sh = self._scaled_pixel_wh()
+        if self.rotation_deg % 360 == 0:
+            return lx, ly
+        _, _, M = self._rotation_dst_size_and_M(sw, sh)
+        Mi = cv2.invertAffineTransform(M)
+        px = float(Mi[0, 0]) * lx + float(Mi[0, 1]) * ly + float(Mi[0, 2])
+        py = float(Mi[1, 0]) * lx + float(Mi[1, 1]) * ly + float(Mi[1, 2])
+        return px, py
+
+    def _keep_corner_scene_fixed(self, corner: int, scene_pt: QPointF) -> None:
+        sw, sh = self._scaled_pixel_wh()
+        ax, ay = self._corner_pre_rot(corner, float(sw), float(sh))
+        disp = self._pre_rot_to_display_local(ax, ay)
+        cur = self.mapToScene(QPointF(disp[0], disp[1]))
+        self.setPos(self.pos() + scene_pt - cur)
 
     def set_rotation_deg(self, deg: int):
         self.rotation_deg = deg % 360
@@ -890,7 +1101,8 @@ class MaterialItem(QGraphicsPixmapItem):
         Returns:
             Optional[Tuple[float, float]]: base 坐标 (bx, by)；若落在画布外则返回 None。
         """
-        sr = float(self.scale_ratio)
+        sr_x = float(self.scale_ratio_x)
+        sr_y = float(self.scale_ratio_y)
         hb, wb = self.base_bgra.shape[:2]
         sw, sh = self._geom_scaled_wh
         if self.rotation_deg % 360 == 0:
@@ -904,8 +1116,8 @@ class MaterialItem(QGraphicsPixmapItem):
             Mi = cv2.invertAffineTransform(M)
             sx = float(Mi[0, 0]) * lx + float(Mi[0, 1]) * ly + float(Mi[0, 2])
             sy = float(Mi[1, 0]) * lx + float(Mi[1, 1]) * ly + float(Mi[1, 2])
-        bx = sx / sr
-        by = sy / sr
+        bx = sx / sr_x
+        by = sy / sr_y
         if bx < -1e-3 or by < -1e-3 or bx > wb - 1 + 1e-3 or by > hb - 1 + 1e-3:
             return None
         return bx, by
@@ -922,13 +1134,14 @@ class MaterialItem(QGraphicsPixmapItem):
         Returns:
             Optional[Tuple[float, float]]: (lx, ly)；无效时返回 None。
         """
-        sr = float(self.scale_ratio)
+        sr_x = float(self.scale_ratio_x)
+        sr_y = float(self.scale_ratio_y)
         sw, sh = self._geom_scaled_wh
         hb, wb = self.base_bgra.shape[:2]
         if bx < -1e-3 or by < -1e-3 or bx > wb - 1 + 1e-3 or by > hb - 1 + 1e-3:
             return None
-        sx = bx * sr
-        sy = by * sr
+        sx = bx * sr_x
+        sy = by * sr_y
         if sx < -1e-3 or sy < -1e-3 or sx > sw - 1 + 1e-3 or sy > sh - 1 + 1e-3:
             return None
         if self.rotation_deg % 360 == 0:
@@ -1058,7 +1271,9 @@ class MaterialItem(QGraphicsPixmapItem):
             "name": self.name,
             "path": self.path,
             "pos": (float(self.scenePos().x()), float(self.scenePos().y())),
-            "scale": float(self.scale_ratio),
+            "scale_x": float(self.scale_ratio_x),
+            "scale_y": float(self.scale_ratio_y),
+            "scale": float(self.scale_ratio_x),
             "rotation": int(self.rotation_deg),
             "tint_color_bgr": tuple(self.tint_color_bgr),
             "tint_alpha": float(self.tint_alpha),
@@ -1098,6 +1313,9 @@ class MaterialItem(QGraphicsPixmapItem):
         elif change == QGraphicsItem.GraphicsItemChange.ItemSelectedChange:
             visible = bool(value)
             for h in self._rotation_handles:
+                h._update_pos()
+                h.setVisible(visible)
+            for h in self._scale_handles:
                 h._update_pos()
                 h.setVisible(visible)
         elif change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
@@ -1407,6 +1625,13 @@ class MainWindow(QMainWindow):
         self.sld_scale.setRange(10, 400)
         self.spn_scale = QSpinBox()
         self.spn_scale.setRange(10, 400)
+        self.sld_scale_y = QSlider(Qt.Orientation.Horizontal)
+        self.sld_scale_y.setRange(10, 400)
+        self.spn_scale_y = QSpinBox()
+        self.spn_scale_y.setRange(10, 400)
+        self.chk_lock_aspect = QCheckBox("锁定宽高比")
+        self.chk_lock_aspect.setChecked(True)
+        self.chk_lock_aspect.setToolTip("勾选时水平/垂直缩放同步；取消后可分别调节或拖拽边/角自由变换。")
         self.chk_tint = QCheckBox("启用颜色叠加")
         self.btn_tint_color = QPushButton("选择叠加颜色")
         self.sld_tint_alpha = QSlider(Qt.Orientation.Horizontal)
@@ -1436,6 +1661,11 @@ class MainWindow(QMainWindow):
         sl.setContentsMargins(0, 0, 0, 0)
         sl.addWidget(self.sld_scale, 1)
         sl.addWidget(self.spn_scale)
+        scale_y_row = QWidget()
+        syl = QHBoxLayout(scale_y_row)
+        syl.setContentsMargins(0, 0, 0, 0)
+        syl.addWidget(self.sld_scale_y, 1)
+        syl.addWidget(self.spn_scale_y)
         alpha_row = QWidget()
         al = QHBoxLayout(alpha_row)
         al.setContentsMargins(0, 0, 0, 0)
@@ -1460,7 +1690,9 @@ class MainWindow(QMainWindow):
 
         form_tf.addRow("处理方式", self.cmb_mode)
         form_tf.addRow("旋转(°)", rot_row)
-        form_tf.addRow("缩放(%)", scale_row)
+        form_tf.addRow("缩放X(%)", scale_row)
+        form_tf.addRow("缩放Y(%)", scale_y_row)
+        form_tf.addRow("", self.chk_lock_aspect)
         form_tf.addRow("颜色叠加", tint_row)
         form_tf.addRow("颜色透明度(%)", alpha_row)
         form_tf.addRow("掩码腐蚀/膨胀(px)", mask_row)
@@ -1513,10 +1745,10 @@ class MainWindow(QMainWindow):
         mbfl.setContentsMargins(0, 0, 0, 0)
         self.sld_mask_br_flow = QSlider(Qt.Orientation.Horizontal)
         self.sld_mask_br_flow.setRange(5, 100)
-        self.sld_mask_br_flow.setValue(65)
+        self.sld_mask_br_flow.setValue(100)
         self.spn_mask_br_flow = QSpinBox()
         self.spn_mask_br_flow.setRange(5, 100)
-        self.spn_mask_br_flow.setValue(65)
+        self.spn_mask_br_flow.setValue(100)
         mbfl.addWidget(self.sld_mask_br_flow, 1)
         mbfl.addWidget(self.spn_mask_br_flow)
 
@@ -1710,6 +1942,12 @@ class MainWindow(QMainWindow):
         self.spn_rot.valueChanged.connect(self.sld_rot.setValue)
         self.sld_scale.valueChanged.connect(self.spn_scale.setValue)
         self.spn_scale.valueChanged.connect(self.sld_scale.setValue)
+        self.sld_scale_y.valueChanged.connect(self.spn_scale_y.setValue)
+        self.spn_scale_y.valueChanged.connect(self.sld_scale_y.setValue)
+        self.sld_scale.valueChanged.connect(self._on_scale_x_ui_changed)
+        self.spn_scale.valueChanged.connect(self._on_scale_x_ui_changed)
+        self.sld_scale_y.valueChanged.connect(self._on_scale_y_ui_changed)
+        self.spn_scale_y.valueChanged.connect(self._on_scale_y_ui_changed)
         self.sld_tint_alpha.valueChanged.connect(self.spn_tint_alpha.setValue)
         self.spn_tint_alpha.valueChanged.connect(self.sld_tint_alpha.setValue)
         self.sld_mask_offset.valueChanged.connect(self.spn_mask_offset.setValue)
@@ -1728,7 +1966,6 @@ class MainWindow(QMainWindow):
         self.spn_gaussian.valueChanged.connect(self.sld_gaussian.setValue)
 
         self.sld_rot.valueChanged.connect(self._apply_props_to_item)
-        self.sld_scale.valueChanged.connect(self._apply_props_to_item)
         self.cmb_mode.currentIndexChanged.connect(self._apply_props_to_item)
         self.chk_tint.toggled.connect(self._apply_props_to_item)
         self.chk_tint_strong.toggled.connect(self._apply_props_to_item)
@@ -2656,6 +2893,8 @@ class MainWindow(QMainWindow):
                 self.cmb_mode.setCurrentIndex(0)
                 self.sld_rot.setValue(0)
                 self.sld_scale.setValue(100)
+                self.sld_scale_y.setValue(100)
+                self.chk_lock_aspect.setChecked(True)
                 self.chk_tint.setChecked(False)
                 self.chk_tint_strong.setChecked(False)
                 self.sld_tint_alpha.setValue(0)
@@ -2672,7 +2911,10 @@ class MainWindow(QMainWindow):
                 return
             self.cmb_mode.setCurrentIndex(m.blend_mode)
             self.sld_rot.setValue(m.rotation_deg)
-            self.sld_scale.setValue(int(round(m.scale_ratio * 100)))
+            self.sld_scale.setValue(int(round(m.scale_ratio_x * 100)))
+            self.sld_scale_y.setValue(int(round(m.scale_ratio_y * 100)))
+            locked = abs(m.scale_ratio_x - m.scale_ratio_y) < 1e-4
+            self.chk_lock_aspect.setChecked(locked)
             self.chk_tint.setChecked(m.tint_alpha > 0)
             self.sld_tint_alpha.setValue(int(round(m.tint_alpha * 100)))
             self.sld_mask_offset.setValue(int(m.mask_offset))
@@ -2702,7 +2944,10 @@ class MainWindow(QMainWindow):
             return
         m.set_blend_mode(self.cmb_mode.currentIndex())
         m.set_rotation_deg(self.sld_rot.value())
-        m.set_scale_ratio(self.sld_scale.value() / 100.0)
+        m.set_scale_ratios(
+            self.sld_scale.value() / 100.0,
+            self.sld_scale_y.value() / 100.0,
+        )
         alpha = (
             (self.sld_tint_alpha.value() / 100.0) if self.chk_tint.isChecked() else 0.0
         )
@@ -3433,7 +3678,10 @@ class MainWindow(QMainWindow):
                     float(sd.get("pos", (0.0, 0.0))[1]),
                 )
             )
-            m.set_scale_ratio(float(sd.get("scale", 1.0)))
+            m.set_scale_ratios(
+                float(sd.get("scale_x", sd.get("scale", 1.0))),
+                float(sd.get("scale_y", sd.get("scale", 1.0))),
+            )
             m.set_rotation_deg(int(sd.get("rotation", 0)))
             color = tuple(sd.get("tint_color_bgr", (0, 0, 0)))
             alpha = float(sd.get("tint_alpha", 0.0))
@@ -3510,6 +3758,46 @@ class MainWindow(QMainWindow):
         finally:
             self._suppress_ui = False
 
+    def _sync_scale_from_item(self, m: MaterialItem) -> None:
+        """从画布自由变换手柄拖拽时同步缩放到属性面板。"""
+        if m != self._current_item():
+            return
+        self._suppress_ui = True
+        try:
+            sx = int(round(m.scale_ratio_x * 100))
+            sy = int(round(m.scale_ratio_y * 100))
+            self.sld_scale.setValue(sx)
+            self.spn_scale.setValue(sx)
+            self.sld_scale_y.setValue(sy)
+            self.spn_scale_y.setValue(sy)
+            self.chk_lock_aspect.setChecked(abs(m.scale_ratio_x - m.scale_ratio_y) < 1e-4)
+        finally:
+            self._suppress_ui = False
+
+    def _on_scale_x_ui_changed(self, value: int) -> None:
+        if self._suppress_ui:
+            return
+        if self.chk_lock_aspect.isChecked():
+            self._suppress_ui = True
+            try:
+                self.sld_scale_y.setValue(value)
+                self.spn_scale_y.setValue(value)
+            finally:
+                self._suppress_ui = False
+        self._apply_props_to_item()
+
+    def _on_scale_y_ui_changed(self, value: int) -> None:
+        if self._suppress_ui:
+            return
+        if self.chk_lock_aspect.isChecked():
+            self._suppress_ui = True
+            try:
+                self.sld_scale.setValue(value)
+                self.spn_scale.setValue(value)
+            finally:
+                self._suppress_ui = False
+        self._apply_props_to_item()
+
 
 def print_basic_usage():
     """启动时在终端输出一次基本操作说明。"""
@@ -3522,7 +3810,7 @@ def print_basic_usage():
 界面说明：
   左侧：素材列表（双击素材加入画布）
   中间：画布预览（滚轮缩放，按住左键拖动画布，点击/拖动素材）
-  右上：已添加素材 + 属性（旋转、缩放、颜色叠加、图层蒙版、全局掩码腐蚀/膨胀、混合模式）
+  右上：已添加素材 + 属性（旋转、缩放X/Y、自由变换手柄、颜色叠加、图层蒙版、全局掩码腐蚀/膨胀、混合模式）
   右下：背景列表 + 背景取色器 / 一键提取背景主色
 
 工具栏常用按钮：
@@ -3540,6 +3828,8 @@ def print_basic_usage():
 提示：
   - 泊松融合 Normal / Mix 模式建议配合“高质量预览”使用。
   - 颜色叠加可配合“强叠加模式”和透明度滑条调节效果。
+  - 选中素材后拖拽四角/四边蓝色方块可自由变换（非均匀缩放）；取消「锁定宽高比」后可分别调节 X/Y。
+  - 拖拽四角外侧红色弧形箭头可旋转素材。
   - 图层蒙版：文件加载 / 从 Alpha 生成 / 画布画笔编辑（橡皮与恢复） / 清除；画笔半径按素材原始像素计。
 ============================================
 """.strip()
