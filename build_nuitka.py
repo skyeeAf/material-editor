@@ -13,6 +13,7 @@ from typing import Sequence
 APP_NAME = "MaterialEditor"
 PROJECT_ROOT = Path(__file__).resolve().parent
 ENTRY_SCRIPT = PROJECT_ROOT / "main.py"
+UI_ASSETS_DIR = PROJECT_ROOT / "ui" / "assets"
 OUTPUT_ROOT = PROJECT_ROOT / "dist-nuitka"
 ENTRY_STEM = ENTRY_SCRIPT.stem
 
@@ -78,6 +79,10 @@ def _nuitka_command(system_name: str) -> list[str]:
 
     for module_name in OPTIONAL_IMPORTS:
         command.append(f"--nofollow-import-to={module_name}")
+
+    if not UI_ASSETS_DIR.is_dir():
+        raise RuntimeError(f"缺少 UI 资源目录: {UI_ASSETS_DIR}")
+    command.append(f"--include-data-dir={UI_ASSETS_DIR}=ui/assets")
 
     command.append(str(ENTRY_SCRIPT))
     return command

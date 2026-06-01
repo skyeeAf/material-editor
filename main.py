@@ -76,7 +76,15 @@ from patchmatch_inpaint import (
 )
 from ui.dialogs import RandomGenerateDialog
 
-_ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "assets")
+
+def _app_base_dir() -> str:
+    """返回应用根目录；PyInstaller 打包后使用解压资源目录。"""
+    if getattr(sys, "frozen", False):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+_ASSETS_DIR = os.path.join(_app_base_dir(), "ui", "assets")
 _ROTATION_HANDLE_SVG = os.path.join(_ASSETS_DIR, "rotation_handle.svg")
 
 

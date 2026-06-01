@@ -13,6 +13,7 @@ from typing import Sequence
 APP_NAME = "MaterialEditor"
 PROJECT_ROOT = Path(__file__).resolve().parent
 ENTRY_SCRIPT = PROJECT_ROOT / "main.py"
+UI_ASSETS_DIR = PROJECT_ROOT / "ui" / "assets"
 BUILD_ROOT = PROJECT_ROOT / "build"
 DIST_ROOT = PROJECT_ROOT / "dist"
 
@@ -70,6 +71,23 @@ def _clean_previous_build(system_name: str) -> None:
     _remove_path(_dist_target(system_name))
 
 
+def _pyinstaller_add_data_arg(source: Path, dest: str) -> str:
+    """生成 PyInstaller --add-data 参数字符串。"""
+    sep = ";" if platform.system() == "Windows" else ":"
+    return f"{source}{sep}{dest}"
+
+
+def _verify_ui_assets_in_dist(system_name: str) -> None:
+    """确认打包产物中包含 UI 静态资源。"""
+    root = _dist_target(system_name)
+    matches = list(root.rglob("rotation_handle.svg"))
+    if not matches:
+        raise RuntimeError(
+            f"构建产物中未找到 ui/assets/rotation_handle.svg，请检查 --add-data 配置: {root}"
+        )
+    print(f"[build] UI 资源已打入包内: {matches[0].relative_to(root)}")
+
+
 def _pyinstaller_command(system_name: str) -> list[str]:
     command = [
         sys.executable,
@@ -93,6 +111,15 @@ def _pyinstaller_command(system_name: str) -> list[str]:
 
     for module_name in OPTIONAL_EXCLUDES:
         command.extend(["--exclude-module", module_name])
+
+    if not UI_ASSETS_DIR.is_dir():
+        raise RuntimeError(f"缺少 UI 资源目录: {UI_ASSETS_DIR}")
+    command.extend(
+        [
+            "--add-data",
+            _pyinstaller_add_data_arg(UI_ASSETS_DIR, "ui/assets"),
+        ]
+    )
 
     command.append(str(ENTRY_SCRIPT))
     return command
@@ -121,6 +148,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"[build] 入口: {ENTRY_SCRIPT}")
     print(f"[build] 输出: {_dist_target(system_name)}")
     subprocess.run(command, cwd=PROJECT_ROOT, check=True)
+    _verify_ui_assets_in_dist(system_name)
     print("[build] 构建完成。")
     return 0
 
