@@ -48,6 +48,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -403,6 +404,127 @@ def crop_to_alpha_bbox(img_bgra: np.ndarray) -> np.ndarray:
     x0, x1 = xs.min(), xs.max() + 1
     y0, y1 = ys.min(), ys.max() + 1
     return img_bgra[y0:y1, x0:x1]
+
+
+def alpha_crop_offset_of_bgra(img_bgra: np.ndarray) -> Tuple[int, int]:
+    """返回按 alpha 外接矩形裁剪时，裁剪区域左上角在原图中的偏移。
+
+    Args:
+        img_bgra (np.ndarray): BGRA 图像。
+
+    Returns:
+        Tuple[int, int]: (crop_x0, crop_y0)。
+    """
+    if img_bgra.shape[2] < 4:
+        return 0, 0
+    alpha = img_bgra[:, :, 3]
+    ys, xs = np.where(alpha > 0)
+    if xs.size == 0 or ys.size == 0:
+        return 0, 0
+    return int(xs.min()), int(ys.min())
+
+
+def resolve_mask_path_for_image(img_path: str) -> Optional[str]:
+    """根据主图路径解析配对的 mask 文件路径。
+
+    Args:
+        img_path (str): 主图文件路径。
+
+    Returns:
+        Optional[str]: 找到的 mask 文件路径；无配对文件时返回 None。
+    """
+    if not img_path or img_path == "__memory__":
+        return None
+    directory = os.path.dirname(img_path)
+    stem, ext = os.path.splitext(os.path.basename(img_path))
+    exts_to_try = [ext]
+    if ext.lower() != ".png":
+        exts_to_try.append(".png")
+    for try_ext in exts_to_try:
+        for suf in MASK_SUFFIXES:
+            if suf == ".mask":
+                name = stem + ".mask" + try_ext
+            else:
+                name = stem + suf + try_ext
+            candidate = os.path.join(directory, name)
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+def build_full_size_mask_from_cropped(
+    cropped_mask: np.ndarray,
+    full_w: int,
+    full_h: int,
+    crop_x0: int,
+    crop_y0: int,
+    base_mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """将裁剪坐标系下的蒙版写回全尺寸 mask 数组。
+
+    Args:
+        cropped_mask (np.ndarray): 与裁剪后素材同尺寸的 uint8 蒙版。
+        full_w (int): 原图宽度。
+        full_h (int): 原图高度。
+        crop_x0 (int): 裁剪区域在原图中的 x 偏移。
+        crop_y0 (int): 裁剪区域在原图中的 y 偏移。
+        base_mask (Optional[np.ndarray], optional): 作为底稿的既有全尺寸蒙版。
+
+    Returns:
+        np.ndarray: 全尺寸 uint8 蒙版。
+    """
+    if base_mask is not None:
+        if base_mask.ndim == 3:
+            out = cv2.cvtColor(base_mask, cv2.COLOR_BGR2GRAY)
+        else:
+            out = base_mask.copy()
+        if out.shape[:2] != (full_h, full_w):
+            out = cv2.resize(out, (full_w, full_h), interpolation=cv2.INTER_NEAREST)
+    else:
+        out = np.zeros((full_h, full_w), dtype=np.uint8)
+    ch, cw = cropped_mask.shape[:2]
+    y1 = min(full_h, crop_y0 + ch)
+    x1 = min(full_w, crop_x0 + cw)
+    out[crop_y0:y1, crop_x0:x1] = cropped_mask[: y1 - crop_y0, : x1 - crop_x0]
+    return out
+
+
+def load_material_src_bgra_from_disk(
+    img_path: str,
+    mask_path: Optional[str] = None,
+    *,
+    ignore_mask_read_error: bool = False,
+) -> Tuple[np.ndarray, Optional[str], Tuple[int, int]]:
+    """从磁盘加载素材、应用 mask 并裁剪到 alpha 外接矩形。
+
+    Args:
+        img_path (str): 主图路径。
+        mask_path (Optional[str], optional): 配对 mask 路径；None 时不应用外部 mask。
+        ignore_mask_read_error (bool, optional, 默认值 False): True 时 mask 读取失败仅忽略 mask。
+
+    Returns:
+        Tuple[np.ndarray, Optional[str], Tuple[int, int]]:
+            (裁剪后 BGRA, 实际使用的 mask 路径, (crop_x0, crop_y0))。
+
+    Raises:
+        RuntimeError: 主图无法读取，或 mask 读取失败且 ignore_mask_read_error 为 False。
+    """
+    src = cv_imread_rgba(img_path)
+    resolved_mask: Optional[str] = mask_path
+    if mask_path:
+        mask_img = cv2.imdecode(
+            np.fromfile(mask_path, dtype=np.uint8), cv2.IMREAD_UNCHANGED
+        )
+        if mask_img is None:
+            if ignore_mask_read_error:
+                resolved_mask = None
+            else:
+                raise RuntimeError(f"无法读取掩码: {mask_path}")
+        else:
+            src = apply_mask_to_bgra(src, mask_img)
+    crop_xy = alpha_crop_offset_of_bgra(src)
+    cropped = crop_to_alpha_bbox(src)
+    return cropped, resolved_mask, crop_xy
 
 
 def _extract_polygon_bgra_from_bg(
@@ -1155,6 +1277,8 @@ class MaterialItem(QGraphicsPixmapItem):
         self.path = path
         self.base_bgra = src_bgra  # original BGRA
         self.memory_png_bytes = memory_png_bytes  # 用于撤销/重做内存素材；否则 None
+        self.source_mask_path: Optional[str] = None  # 加载时配对的磁盘 mask 路径
+        self.alpha_crop_xy: Optional[Tuple[int, int]] = None  # alpha 裁剪偏移 (x0, y0)
         self.blend_mode = BlendMode.PASTE
         self.scale_ratio_x = 1.0
         self.scale_ratio_y = 1.0
@@ -1592,6 +1716,24 @@ class MaterialItem(QGraphicsPixmapItem):
         """移除当前素材的图层蒙版。"""
         self.layer_mask_u8 = None
         self._update_pix()
+
+    def compute_effective_mask_u8(self) -> np.ndarray:
+        """计算 base alpha 与图层蒙版相乘后的 effective mask。
+
+        Returns:
+            np.ndarray: 与 base_bgra 同尺寸的 uint8 蒙版。
+        """
+        h, w = self.base_bgra.shape[:2]
+        if self.base_bgra.shape[2] >= 4:
+            alpha = self.base_bgra[:, :, 3].astype(np.float32)
+        else:
+            alpha = np.full((h, w), 255.0, dtype=np.float32)
+        if self.layer_mask_u8 is not None:
+            lm = self.layer_mask_u8
+            if lm.shape[:2] != (h, w):
+                lm = cv2.resize(lm, (w, h), interpolation=cv2.INTER_NEAREST)
+            alpha = alpha * (lm.astype(np.float32) / 255.0)
+        return np.clip(alpha, 0, 255).astype(np.uint8)
 
     def apply_alpha_channel_as_layer_mask(self) -> None:
         """使用当前像素图层自带的 Alpha 通道生成图层蒙版。
@@ -2120,6 +2262,21 @@ class MainWindow(QMainWindow):
         self.list_materials.setSelectionMode(
             QAbstractItemView.SelectionMode.SingleSelection
         )
+        self.list_materials.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.list_materials.customContextMenuRequested.connect(
+            self._on_materials_context_menu
+        )
+        act_remove_material_lib = QAction("从素材库移除", self)
+        act_remove_material_lib.setShortcut(QKeySequence(Qt.Key.Key_Delete))
+        act_remove_material_lib.setShortcutContext(
+            Qt.ShortcutContext.WidgetShortcut
+        )
+        act_remove_material_lib.triggered.connect(
+            self._remove_selected_materials_from_library
+        )
+        self.list_materials.addAction(act_remove_material_lib)
         vl.addWidget(lbl)
         vl.addWidget(self.list_materials, 1)
         return w
@@ -2310,6 +2467,11 @@ class MainWindow(QMainWindow):
             "将素材像素自带的透明度通道复制为图层蒙版（与像素 alpha 相乘）。"
         )
         self.btn_layer_mask_clear = QPushButton("清除")
+        self.btn_layer_mask_overwrite = QPushButton("覆盖原 Mask 文件")
+        self.btn_layer_mask_overwrite.setToolTip(
+            "将当前 effective 蒙版写回磁盘上配对的黑白 mask 文件；"
+            "不影响画布上已放置的素材，之后新放置的素材会使用更新后的 mask。"
+        )
         lml.addWidget(self.lbl_layer_mask_status, 1)
         lml.addWidget(self.btn_layer_mask_load)
         lml.addWidget(self.btn_layer_mask_from_alpha)
@@ -2363,6 +2525,7 @@ class MainWindow(QMainWindow):
         form_mk.addRow("蒙版工具", mask_tool_row)
         form_mk.addRow("笔刷半径(px)", mask_br_radius_row)
         form_mk.addRow("流量(%)", mask_br_flow_row)
+        form_mk.addRow("", self.btn_layer_mask_overwrite)
 
         form_tf.addRow("羽化(px)", feather_row)
 
@@ -2617,6 +2780,9 @@ class MainWindow(QMainWindow):
             self._create_layer_mask_from_alpha_for_current_item,
         )
         self.btn_layer_mask_clear.clicked.connect(self._clear_layer_mask_for_current_item)
+        self.btn_layer_mask_overwrite.clicked.connect(
+            self._overwrite_source_mask_file_for_current_item
+        )
 
         self.chk_layer_mask_paint.toggled.connect(self._on_toggle_layer_mask_paint)
         self._grp_mask_brush_tool.buttonClicked.connect(self._on_mask_brush_tool_clicked)
@@ -2906,6 +3072,9 @@ class MainWindow(QMainWindow):
                 self.act_lasso_fill.setChecked(False)
                 return
         if event.key() == Qt.Key.Key_Delete:
+            if self.list_materials.hasFocus():
+                self._remove_selected_materials_from_library()
+                return
             self._delete_selected_added()
             return
         super().keyPressEvent(event)
@@ -2975,6 +3144,103 @@ class MainWindow(QMainWindow):
             item.setIcon(icon)
             self.list_materials.addItem(item)
 
+    def _on_materials_context_menu(self, pos) -> None:
+        """左侧素材库右键菜单。"""
+        item = self.list_materials.itemAt(pos)
+        if item is None:
+            return
+        self.list_materials.setCurrentItem(item)
+        menu = QMenu(self)
+        act = menu.addAction("从素材库移除")
+        act.triggered.connect(self._remove_selected_materials_from_library)
+        menu.exec(self.list_materials.mapToGlobal(pos))
+
+    def _remove_selected_materials_from_library(self) -> None:
+        """从左侧素材库移除选中项，不影响画布上已放置的素材。"""
+        row = self.list_materials.currentRow()
+        if row < 0:
+            return
+        self.list_materials.takeItem(row)
+
+    def _mask_path_for_material_item(self, m: MaterialItem) -> Optional[str]:
+        """解析画布素材项对应的磁盘 mask 文件路径。
+
+        Args:
+            m (MaterialItem): 画布素材项。
+
+        Returns:
+            Optional[str]: mask 文件路径；无配对文件时返回 None。
+        """
+        if m.source_mask_path and os.path.isfile(m.source_mask_path):
+            return m.source_mask_path
+        if m.path and m.path != "__memory__":
+            return resolve_mask_path_for_image(m.path)
+        return None
+
+    def _infer_alpha_crop_xy_for_material(self, m: MaterialItem) -> Tuple[int, int]:
+        """推断素材 alpha 裁剪偏移，用于写回全尺寸 mask。
+
+        Args:
+            m (MaterialItem): 画布素材项。
+
+        Returns:
+            Tuple[int, int]: (crop_x0, crop_y0)。
+        """
+        if m.alpha_crop_xy is not None:
+            return m.alpha_crop_xy
+        if not m.path or m.path == "__memory__":
+            return 0, 0
+        mask_path = self._mask_path_for_material_item(m)
+        try:
+            src = cv_imread_rgba(m.path)
+            if mask_path:
+                mask_img = cv2.imdecode(
+                    np.fromfile(mask_path, dtype=np.uint8), cv2.IMREAD_UNCHANGED
+                )
+                if mask_img is not None:
+                    src = apply_mask_to_bgra(src, mask_img)
+            return alpha_crop_offset_of_bgra(src)
+        except Exception:
+            return 0, 0
+
+    def _overwrite_source_mask_file_for_current_item(self) -> None:
+        """将当前 effective 蒙版写回磁盘配对 mask 文件，不修改画布上已有素材。"""
+        m = self._current_item()
+        if m is None:
+            QMessageBox.information(self, "提示", "请先选择一个素材。")
+            return
+        if m.path == "__memory__":
+            QMessageBox.information(self, "提示", "内存素材无配对 mask 文件。")
+            return
+        mask_path = self._mask_path_for_material_item(m)
+        if not mask_path:
+            QMessageBox.information(
+                self, "提示", "未找到配对的 mask 文件（如 *_mask.png）。"
+            )
+            return
+        try:
+            full_img = cv_imread_rgba(m.path)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", str(e))
+            return
+        full_h, full_w = full_img.shape[:2]
+        crop_x0, crop_y0 = self._infer_alpha_crop_xy_for_material(m)
+        effective = m.compute_effective_mask_u8()
+        existing_raw = np.fromfile(mask_path, dtype=np.uint8)
+        existing = cv2.imdecode(existing_raw, cv2.IMREAD_UNCHANGED)
+        out_mask = build_full_size_mask_from_cropped(
+            effective,
+            full_w,
+            full_h,
+            crop_x0,
+            crop_y0,
+            existing,
+        )
+        if not cv_imwrite_bgr(mask_path, out_mask):
+            QMessageBox.critical(self, "错误", f"写入失败: {mask_path}")
+            return
+        QMessageBox.information(self, "完成", f"已覆盖 mask 文件:\n{mask_path}")
+
     def _on_add_material_from_left(self, item: QListWidgetItem):
         data = item.data(Qt.ItemDataRole.UserRole)
         if isinstance(data, dict):
@@ -2987,23 +3253,19 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "错误", "无效的素材路径。")
             return
         try:
-            src = cv_imread_rgba(path)
+            src, used_mask, crop_xy = load_material_src_bgra_from_disk(
+                path, mask_path, ignore_mask_read_error=True
+            )
         except Exception as e:
             QMessageBox.critical(self, "错误", str(e))
             return
-        if mask_path:
-            mask_img = cv2.imdecode(
-                np.fromfile(mask_path, dtype=np.uint8), cv2.IMREAD_UNCHANGED
+        if mask_path and used_mask is None:
+            QMessageBox.warning(
+                self, "警告", f"无法读取掩码: {mask_path}，将忽略该掩码。"
             )
-            if mask_img is None:
-                QMessageBox.warning(
-                    self, "警告", f"无法读取掩码: {mask_path}，将忽略该掩码。"
-                )
-            else:
-                src = apply_mask_to_bgra(src, mask_img)
-        # 根据 alpha 裁剪到掩码区域，缩小物体框线
-        src = crop_to_alpha_bbox(src)
         m = MaterialItem(os.path.basename(path), path, src, self)
+        m.source_mask_path = used_mask
+        m.alpha_crop_xy = crop_xy
         self.scene.addItem(m)
         m.setZValue(len(self.material_items))
 
@@ -3204,17 +3466,14 @@ class MainWindow(QMainWindow):
             if not isinstance(img_path, str) or not img_path:
                 continue
             try:
-                src = cv_imread_rgba(img_path)
+                src, used_mask, crop_xy = load_material_src_bgra_from_disk(
+                    str(img_path),
+                    mask_path if isinstance(mask_path, str) else None,
+                    ignore_mask_read_error=True,
+                )
             except Exception as e:
                 print(f"加载素材失败 {img_path}: {e}")
                 continue
-            if mask_path:
-                mask_img = cv2.imdecode(
-                    np.fromfile(mask_path, dtype=np.uint8), cv2.IMREAD_UNCHANGED
-                )
-                if mask_img is not None:
-                    src = apply_mask_to_bgra(src, mask_img)
-            src = crop_to_alpha_bbox(src)
 
             # 随机旋转/缩放参数
             if rotation_conf["enabled"]:
@@ -3255,6 +3514,8 @@ class MainWindow(QMainWindow):
             m_item = MaterialItem(
                 os.path.basename(str(img_path)), str(img_path), src, self
             )
+            m_item.source_mask_path = used_mask
+            m_item.alpha_crop_xy = crop_xy
             self.scene.addItem(m_item)
             m_item.setZValue(len(self.material_items))
 
@@ -3556,6 +3817,7 @@ class MainWindow(QMainWindow):
                 self._set_tint_button_color(None)
                 self.lbl_layer_mask_status.setText("图层蒙版: —")
                 self.chk_layer_mask_paint.setEnabled(False)
+                self.btn_layer_mask_overwrite.setEnabled(False)
                 return
             self.cmb_mode.setCurrentIndex(m.blend_mode)
             self.sld_rot.setValue(int(round(m.rotation_deg)) % 360)
@@ -3582,6 +3844,9 @@ class MainWindow(QMainWindow):
             self._set_tint_button_color(m.tint_color_bgr if m.tint_alpha > 0 else None)
             self.lbl_layer_mask_status.setText(
                 "图层蒙版: 已启用" if m.layer_mask_u8 is not None else "图层蒙版: 无"
+            )
+            self.btn_layer_mask_overwrite.setEnabled(
+                m.path != "__memory__" and self._mask_path_for_material_item(m) is not None
             )
         finally:
             self._suppress_ui = False
